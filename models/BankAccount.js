@@ -1,0 +1,700 @@
+// models/BankAccount.js - PostgreSQL Version (Prisma) - COMPLETE FIXED
+
+const prisma = require('../prisma/client');
+
+const VALID_ACCOUNT_TYPES = ['Current', 'Savings', 'Business', 'Islamic', 'Cash'];
+const VALID_STATUS = ['Active', 'Inactive'];
+
+class BankAccountModel {
+  static normalizeIban(iban) {
+    return String(iban || '')
+      .replace(/\s+/g, '')
+      .toUpperCase();
+  }
+
+  static isValidIban(iban) {
+    const value = this.normalizeIban(iban);
+    // Pakistan IBAN: PK + 2 check digits + 4 bank code + 16 account digits = 24 chars
+    if (/^PK\d{2}[A-Z]{4}\d{16}$/.test(value)) return true;
+    // Generic IBAN (15–34 alphanumeric) for multi-currency accounts
+    return /^[A-Z]{2}\d{2}[A-Z0-9]{11,30}$/.test(value);
+  }
+
+  static validateBankAccountData(data, { requireIban = true } = {}) {
+    const errors = [];
+    if (!data.accountName) errors.push('Account name is required');
+    if (!data.accountNumber) errors.push('Account number is required');
+    if (!data.bankName) errors.push('Bank name is required');
+    if (!data.chartOfAccountId) errors.push('Chart of account ID is required');
+    const iban = this.normalizeIban(data.iban);
+    if (requireIban && !iban) {
+      errors.push('IBAN is required');
+    } else if (iban && !this.isValidIban(iban)) {
+      errors.push('IBAN format is invalid (e.g. PK36MEZN0001234567890123)');
+    }
+    if (data.accountType && !VALID_ACCOUNT_TYPES.includes(data.accountType)) {
+      errors.push(`Invalid account type. Must be one of: ${VALID_ACCOUNT_TYPES.join(', ')}`);
+    }
+    if (data.status && !VALID_STATUS.includes(data.status)) {
+      errors.push(`Invalid status. Must be one of: ${VALID_STATUS.join(', ')}`);
+    }
+    if (data.openingBalance && data.openingBalance < 0) {
+      errors.push('Opening balance cannot be negative');
+    }
+
+    return errors;
+  }
+  static async generateAccountCode(companyId) {
+    // Find all bank accounts for this company
+    const bankAccounts = await prisma.bankAccount.findMany({
+      where: {
+        companyId: companyId
+      },
+      orderBy: {
+        accountCode: 'asc'
+      }
+    });
+
+    if (bankAccounts.length === 0) {
+      return '1020';
+    }
+
+    // Extract codes and find max
+    const codes = bankAccounts
+      .map(a => parseInt(a.accountCode))
+      .filter(c => !isNaN(c));
+    
+    if (codes.length === 0) return '1020';
+    
+    const maxCode = Math.max(...codes);
+    return (maxCode + 1).toString();
+  }
+  static async generateAccountNumber(companyId) {
+    const count = await prisma.bankAccount.count({
+      where: {
+        companyId: companyId
+      }
+    });
+    
+    const year = new Date().getFullYear();
+    const padded = String(count + 1).padStart(4, '0');
+    return `BA-${year}-${padded}`;
+  }
+
+  static async create(data) {
+    const errors = this.validateBankAccountData(data);
+    if (errors.length > 0) {
+      throw new Error(errors.join('; '));
+    }
+    let accountCode = data.accountCode;
+    if (!accountCode) {
+      accountCode = await this.generateAccountCode(data.companyId);
+    }
+    return await prisma.bankAccount.create({
+      data: {
+        accountName: data.accountName,
+        accountNumber: data.accountNumber,
+        iban: this.normalizeIban(data.iban),
+        bankName: data.bankName,
+        branchCode: data.branchCode || '',
+        accountCode: accountCode,
+        accountType: data.accountType || 'Current',
+        currency: data.currency || 'PKR',
+        openingBalance: data.openingBalance || 0,
+        currentBalance: data.openingBalance || 0,
+        status: data.status || 'Active',
+        lastReconciled: data.lastReconciled || new Date(),
+        chartOfAccountId: data.chartOfAccountId,
+        createdBy: data.createdBy,
+        companyId: data.companyId // 👈 CRITICAL: Link to company
+      },
+      include: {
+        chartOfAccount: {
+          select: {
+            id: true,
+            code: true,
+            name: true,
+            type: true,
+            currentBalance: true
+          }
+        },
+        creator: {
+          select: {
+            id: true,
+            firstName: true,
+            lastName: true,
+            email: true
+          }
+        }
+      }
+    });
+  }
+
+  // ============================================================
+  // ✅ GET ALL BANK ACCOUNTS WITH FILTERS - FIXED
+  // ============================================================
+  static async findAll(filter = {}, options = {}) {
+    const { skip, take, orderBy = { createdAt: 'desc' } } = options;
+
+    // ✅ FIXED: If filter has companyId, use it directly
+    if (filter.companyId) {
+      const companyId = filter.companyId;
+      delete filter.companyId;
+      filter.companyId = companyId;
+    }
+
+    return await prisma.bankAccount.findMany({
+      where: filter,
+      skip,
+      take,
+      orderBy,
+      include: {
+        chartOfAccount: {
+          select: {
+            id: true,
+            code: true,
+            name: true,
+            type: true,
+            currentBalance: true
+          }
+        },
+        creator: {
+          select: {
+            id: true,
+            firstName: true,
+            lastName: true,
+            email: true
+          }
+        }
+      }
+    });
+  }
+
+  static async count(filter = {}) {
+    // ✅ FIXED: If filter has companyId, use it directly
+    if (filter.companyId) {
+      const companyId = filter.companyId;
+      delete filter.companyId;
+      filter.companyId = companyId;
+    }
+    return await prisma.bankAccount.count({ where: filter });
+  }
+
+  static async findById(id) {
+    return await prisma.bankAccount.findUnique({
+      where: { id },
+      include: {
+        chartOfAccount: {
+          select: {
+            id: true,
+            code: true,
+            name: true,
+            type: true,
+            currentBalance: true
+          }
+        },
+        creator: {
+          select: {
+            id: true,
+            firstName: true,
+            lastName: true,
+            email: true
+          }
+        }
+      }
+    });
+  }
+
+  // ============================================================
+  // ✅ FIND BANK ACCOUNT BY ACCOUNT NUMBER - FIXED
+  // ============================================================
+  static async findByAccountNumber(accountNumber, companyId) {
+    return await prisma.bankAccount.findFirst({
+      where: {
+        accountNumber,
+        companyId: companyId
+      },
+      include: {
+        chartOfAccount: {
+          select: {
+            id: true,
+            code: true,
+            name: true,
+            type: true,
+            currentBalance: true
+          }
+        }
+      }
+    });
+  }
+
+  // ============================================================
+  // ✅ UPDATE BANK ACCOUNT
+  // ============================================================
+  static async update(id, data) {
+    // ─── Get existing account ──────────────────────────────────
+    const existing = await prisma.bankAccount.findUnique({
+      where: { id }
+    });
+
+    if (!existing) return null;
+
+    // ─── Merge data for validation ─────────────────────────────
+    const mergedData = { ...existing, ...data };
+    if (data.iban !== undefined) {
+      mergedData.iban = this.normalizeIban(data.iban);
+    }
+
+    // Legacy rows may lack IBAN; require it only when creating or when an IBAN is supplied
+    const errors = this.validateBankAccountData(mergedData, {
+      requireIban: Boolean(mergedData.iban),
+    });
+    if (errors.length > 0) {
+      throw new Error(errors.join('; '));
+    }
+
+    // ─── Update bank account ────────────────────────────────────
+    const updatePayload = {
+      accountName: data.accountName,
+      accountNumber: data.accountNumber,
+      bankName: data.bankName,
+      branchCode: data.branchCode,
+      accountType: data.accountType,
+      currency: data.currency,
+      status: data.status,
+      lastReconciled: data.lastReconciled,
+    };
+    if (data.iban !== undefined) {
+      updatePayload.iban = this.normalizeIban(data.iban);
+    }
+
+    return await prisma.bankAccount.update({
+      where: { id },
+      data: updatePayload,
+      include: {
+        chartOfAccount: {
+          select: {
+            id: true,
+            code: true,
+            name: true,
+            type: true,
+            currentBalance: true
+          }
+        },
+        creator: {
+          select: {
+            id: true,
+            firstName: true,
+            lastName: true,
+            email: true
+          }
+        }
+      }
+    });
+  }
+
+  // ============================================================
+  // ✅ UPDATE BANK ACCOUNT BALANCE
+  // ============================================================
+  static async updateBalance(id, amount, type = 'add') {
+    const account = await prisma.bankAccount.findUnique({
+      where: { id }
+    });
+
+    if (!account) return null;
+
+    let newBalance = account.currentBalance;
+    const amountNum = parseFloat(amount);
+
+    if (type === 'add' || type === 'credit') {
+      newBalance += amountNum;
+    } else if (type === 'subtract' || type === 'debit') {
+      newBalance -= amountNum;
+    } else if (type === 'set') {
+      newBalance = amountNum;
+    } else {
+      throw new Error('Invalid type. Use: add, subtract, credit, debit, or set');
+    }
+
+    // Update bank account
+    const updated = await prisma.bankAccount.update({
+      where: { id },
+      data: { currentBalance: newBalance }
+    });
+
+    // Update chart of account balance
+    await prisma.chartOfAccount.update({
+      where: { id: account.chartOfAccountId },
+      data: { currentBalance: newBalance }
+    });
+
+    return updated;
+  }
+
+  // ============================================================
+  // ✅ RECONCILE BANK ACCOUNT
+  // ============================================================
+  static async reconcile(id, statementBalance, reconciledDate) {
+    const account = await prisma.bankAccount.findUnique({
+      where: { id }
+    });
+
+    if (!account) return null;
+
+    const difference = statementBalance - account.currentBalance;
+
+    return await prisma.bankAccount.update({
+      where: { id },
+      data: {
+        lastReconciled: reconciledDate ? new Date(reconciledDate) : new Date()
+      },
+      include: {
+        chartOfAccount: {
+          select: {
+            id: true,
+            code: true,
+            name: true,
+            type: true,
+            currentBalance: true
+          }
+        }
+      }
+    });
+  }
+
+  // ============================================================
+  // ✅ DELETE BANK ACCOUNT
+  // ============================================================
+  static async delete(id) {
+    // ─── Check if account exists ──────────────────────────────
+    const account = await prisma.bankAccount.findUnique({
+      where: { id }
+    });
+
+    if (!account) return null;
+
+    // ─── Delete bank account ────────────────────────────────────
+    return await prisma.bankAccount.delete({
+      where: { id }
+    });
+  }
+
+  // ============================================================
+  // ✅ GET BANK ACCOUNT SUMMARY
+  // ============================================================
+  static async getSummary(accounts) {
+    const summary = {
+      totalBalance: 0,
+      byCurrency: {},
+      byType: {},
+      activeCount: 0,
+      inactiveCount: 0
+    };
+
+    accounts.forEach(account => {
+      // Total balance
+      summary.totalBalance += account.currentBalance || 0;
+
+      // By currency
+      const currency = account.currency || 'PKR';
+      if (!summary.byCurrency[currency]) {
+        summary.byCurrency[currency] = { count: 0, balance: 0 };
+      }
+      summary.byCurrency[currency].count++;
+      summary.byCurrency[currency].balance += account.currentBalance || 0;
+
+      // By type
+      const type = account.accountType || 'Current';
+      if (!summary.byType[type]) {
+        summary.byType[type] = { count: 0, balance: 0 };
+      }
+      summary.byType[type].count++;
+      summary.byType[type].balance += account.currentBalance || 0;
+
+      // By status
+      if (account.status === 'Active') {
+        summary.activeCount++;
+      } else {
+        summary.inactiveCount++;
+      }
+    });
+
+    return summary;
+  }
+
+  // ============================================================
+  // ✅ GET BANK ACCOUNTS BY TYPE - FIXED
+  // ============================================================
+  static async findByType(accountType, companyId) {
+    return await prisma.bankAccount.findMany({
+      where: {
+        accountType,
+        status: 'Active',
+        companyId: companyId
+      },
+      orderBy: { accountName: 'asc' },
+      include: {
+        chartOfAccount: {
+          select: {
+            id: true,
+            code: true,
+            name: true,
+            type: true,
+            currentBalance: true
+          }
+        }
+      }
+    });
+  }
+
+  // ============================================================
+  // ✅ GET BANK ACCOUNTS BY STATUS - FIXED
+  // ============================================================
+  static async findByStatus(status, companyId) {
+    return await prisma.bankAccount.findMany({
+      where: {
+        status,
+        companyId: companyId
+      },
+      orderBy: { accountName: 'asc' },
+      include: {
+        chartOfAccount: {
+          select: {
+            id: true,
+            code: true,
+            name: true,
+            type: true,
+            currentBalance: true
+          }
+        }
+      }
+    });
+  }
+
+  // ============================================================
+  // ✅ SEARCH BANK ACCOUNTS - FIXED
+  // ============================================================
+  static async search(query, companyId, options = {}) {
+    const { skip, take } = options;
+
+    const filter = {
+      companyId: companyId,
+      OR: [
+        { accountName: { contains: query, mode: 'insensitive' } },
+        { accountNumber: { contains: query, mode: 'insensitive' } },
+        { bankName: { contains: query, mode: 'insensitive' } },
+        { accountCode: { contains: query, mode: 'insensitive' } }
+      ]
+    };
+
+    const accounts = await prisma.bankAccount.findMany({
+      where: filter,
+      skip,
+      take,
+      orderBy: { accountName: 'asc' },
+      include: {
+        chartOfAccount: {
+          select: {
+            id: true,
+            code: true,
+            name: true,
+            type: true,
+            currentBalance: true
+          }
+        },
+        creator: {
+          select: {
+            id: true,
+            firstName: true,
+            lastName: true,
+            email: true
+          }
+        }
+      }
+    });
+
+    const total = await prisma.bankAccount.count({ where: filter });
+
+    return { accounts, total };
+  }
+
+  // ============================================================
+  // ✅ GET BANK ACCOUNT TRANSACTIONS
+  // ============================================================
+  static async getTransactions(accountId, options = {}) {
+    const { startDate, endDate, skip = 0, take = 20, search = '' } = options;
+
+    const bankAccount = await prisma.bankAccount.findUnique({
+      where: { id: accountId },
+    });
+
+    if (!bankAccount) return { transactions: [], total: 0 };
+
+    const journalFilter = {
+      status: 'Posted',
+      ...(bankAccount.companyId ? { companyId: bankAccount.companyId } : {}),
+    };
+
+    if (startDate || endDate) {
+      journalFilter.date = {};
+      if (startDate) journalFilter.date.gte = new Date(startDate);
+      if (endDate) {
+        const end = new Date(endDate);
+        end.setHours(23, 59, 59, 999);
+        journalFilter.date.lte = end;
+      }
+    }
+
+    if (search && String(search).trim()) {
+      const q = String(search).trim();
+      journalFilter.OR = [
+        { description: { contains: q, mode: 'insensitive' } },
+        { reference: { contains: q, mode: 'insensitive' } },
+        { entryNumber: { contains: q, mode: 'insensitive' } },
+      ];
+    }
+
+    const whereClause = {
+      accountId: bankAccount.chartOfAccountId,
+      journal: journalFilter,
+    };
+
+    const [lines, total] = await Promise.all([
+      prisma.journalLine.findMany({
+        where: whereClause,
+        include: {
+          journal: {
+            select: {
+              id: true,
+              entryNumber: true,
+              date: true,
+              description: true,
+              reference: true,
+              type: true,
+              status: true,
+            },
+          },
+        },
+        orderBy: [{ journal: { date: 'desc' } }, { id: 'desc' }],
+        skip,
+        take,
+      }),
+      prisma.journalLine.count({ where: whereClause }),
+    ]);
+
+    const transactions = lines.map((line) => {
+      const debit = Number(line.debit) || 0;
+      const credit = Number(line.credit) || 0;
+      return {
+        id: line.id,
+        journalEntryId: line.journalId,
+        entryNumber: line.journal?.entryNumber || '',
+        date: line.journal?.date || null,
+        description: line.journal?.description || '',
+        reference: line.journal?.reference || '',
+        type: line.journal?.type || 'Normal',
+        debit,
+        credit,
+        amount: debit > 0 ? debit : credit,
+        direction: debit > 0 ? 'in' : 'out',
+        isReconciled: !!line.isReconciled,
+      };
+    });
+
+    return { transactions, total };
+  }
+
+  // ============================================================
+  // ✅ BULK IMPORT BANK ACCOUNTS - FIXED
+  // ============================================================
+  static async bulkImport(accountsData, companyId) {
+    const results = {
+      success: [],
+      failed: [],
+      total: accountsData.length
+    };
+
+    for (const data of accountsData) {
+      try {
+        // Validate each account
+        const errors = this.validateBankAccountData(data);
+        if (errors.length > 0) {
+          results.failed.push({ ...data, error: errors.join('; ') });
+          continue;
+        }
+
+        // Check duplicate account number
+        const existing = await prisma.bankAccount.findFirst({
+          where: {
+            accountNumber: data.accountNumber,
+            companyId: companyId
+          }
+        });
+
+        if (existing) {
+          results.failed.push({
+            ...data,
+            error: `Account number "${data.accountNumber}" already exists`
+          });
+          continue;
+        }
+
+        // Create account
+        const account = await this.create({
+          ...data,
+          createdBy: data.createdBy,
+          companyId: companyId // 👈 CRITICAL: Link to company
+        });
+
+        results.success.push(account);
+      } catch (error) {
+        results.failed.push({ ...data, error: error.message });
+      }
+    }
+
+    return results;
+  }
+
+  // ============================================================
+  // ✅ GET TOTAL BALANCE BY CURRENCY - FIXED
+  // ============================================================
+  static async getBalanceByCurrency(companyId) {
+    const accounts = await prisma.bankAccount.findMany({
+      where: {
+        status: 'Active',
+        companyId: companyId
+      }
+    });
+
+    const balanceByCurrency = {};
+    accounts.forEach(account => {
+      const currency = account.currency || 'PKR';
+      if (!balanceByCurrency[currency]) {
+        balanceByCurrency[currency] = 0;
+      }
+      balanceByCurrency[currency] += account.currentBalance || 0;
+    });
+
+    return balanceByCurrency;
+  }
+
+  // ============================================================
+  // ✅ GET BANK ACCOUNT WITH LATEST TRANSACTIONS
+  // ============================================================
+  static async getWithLatestTransactions(accountId, limit = 5) {
+    const bankAccount = await this.findById(accountId);
+
+    if (!bankAccount) return null;
+
+    const transactions = await this.getTransactions(accountId, {
+      take: limit
+    });
+
+    return {
+      ...bankAccount,
+      recentTransactions: transactions.transactions
+    };
+  }
+}
+
+module.exports = BankAccountModel;

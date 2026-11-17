@@ -1,0 +1,706 @@
+// warehouse/controller/customerController.js - COMPLETE CORRECTED
+
+const prisma = require('../../prisma/client');
+
+function normalizeEmail(email) {
+  if (!email || typeof email !== 'string') return null;
+  const trimmed = email.trim().toLowerCase();
+  return trimmed || null;
+}
+
+/** UI expects `company`; Prisma stores `companyName`. */
+function normalizeCustomer(customer) {
+  if (!customer || typeof customer !== 'object') return customer;
+  const company =
+    customer.company ??
+    customer.companyName ??
+    null;
+  return {
+    ...customer,
+    company,
+    companyName: customer.companyName ?? company,
+  };
+}
+
+function normalizeCustomers(list) {
+  if (!Array.isArray(list)) return list;
+  return list.map(normalizeCustomer);
+}
+
+/**
+ * customer_number is globally unique (not per-company).
+ * Compute next CUST-##### from the true max across all customers.
+ */
+async function generateUniqueCustomerNumber(maxAttempts = 5) {
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const lastCustomer = await prisma.customer.findFirst({
+      where: { customerNumber: { startsWith: 'CUST-' } },
+      orderBy: { customerNumber: 'desc' },
+      select: { customerNumber: true }
+    });
+
+    let nextNumber = 1;
+    if (lastCustomer?.customerNumber) {
+      const lastNum = parseInt(
+        String(lastCustomer.customerNumber).replace(/^CUST-/i, ''),
+        10
+      );
+      if (Number.isFinite(lastNum) && lastNum > 0) {
+        nextNumber = lastNum + 1 + attempt;
+      }
+    } else {
+      nextNumber = 1 + attempt;
+    }
+
+    const customerNumber = `CUST-${String(nextNumber).padStart(5, '0')}`;
+
+    const exists = await prisma.customer.findFirst({
+      where: { customerNumber },
+      select: { id: true }
+    });
+    if (!exists) return customerNumber;
+  }
+
+  // Fallback when concurrent creates race on padded sequence
+  return `CUST-${Date.now().toString().slice(-8)}`;
+}
+
+const getCustomers = async (req, res) => {
+  try {
+    const companyId = (req.method === 'GET' || req.method === 'HEAD')
+      ? (req.companyIdFilter ?? req.user.companyId)
+      : req.user.companyId;
+
+    if (companyId == null || companyId === '') {
+      return res.status(400).json({
+        success: false,
+        message: 'Company context required to list customers',
+      });
+    }
+
+    const {
+      page = 1, limit = 10, search, type, status,
+      fromDate, toDate, sortBy = 'createdAt', sortOrder = 'desc'
+    } = req.query;
+
+    const allowedSort = new Set([
+      'createdAt',
+      'updatedAt',
+      'name',
+      'customerNumber',
+      'totalSpent',
+      'totalOrders',
+      'status',
+      'customerType',
+    ]);
+    const sortField = allowedSort.has(String(sortBy)) ? String(sortBy) : 'createdAt';
+
+    const where = { companyId, isActive: true, isDeleted: false };
+
+    if (search) {
+      where.OR = [
+        { name: { contains: search, mode: 'insensitive' } },
+        { email: { contains: search, mode: 'insensitive' } },
+        { phone: { contains: search, mode: 'insensitive' } },
+        { companyName: { contains: search, mode: 'insensitive' } },
+        { customerNumber: { contains: search, mode: 'insensitive' } }
+      ];
+    }
+    if (type && type !== 'all') where.customerType = type;
+    if (status && status !== 'all') where.status = status;
+    if (fromDate || toDate) {
+      where.createdAt = {};
+      if (fromDate) where.createdAt.gte = new Date(fromDate);
+      if (toDate) {
+        const endDate = new Date(toDate);
+        endDate.setHours(23, 59, 59, 999);
+        where.createdAt.lte = endDate;
+      }
+    }
+
+    const pageNum = parseInt(page, 10) || 1;
+    const limitNum = parseInt(limit, 10) || 10;
+    const skip = (pageNum - 1) * limitNum;
+
+    const [customers, total] = await Promise.all([
+      prisma.customer.findMany({
+        where,
+        skip,
+        take: limitNum,
+        orderBy: { [sortField]: sortOrder === 'desc' ? 'desc' : 'asc' }
+      }),
+      prisma.customer.count({ where })
+    ]);
+
+    const allActive = await prisma.customer.count({
+      where: { companyId, isActive: true, isDeleted: false },
+    });
+    const stats = { total: allActive };
+
+    res.status(200).json({
+      success: true,
+      data: normalizeCustomers(customers),
+      stats,
+      pagination: {
+        page: pageNum, limit: limitNum, total,
+        pages: Math.ceil(total / limitNum) || 0,
+        hasNext: pageNum < Math.ceil(total / limitNum),
+        hasPrev: pageNum > 1
+      }
+    });
+  } catch (error) {
+    console.error('Get customers error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch customers',
+      error: error.message,
+    });
+  }
+};
+
+const getCustomerById = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const companyId = req.user.companyId;
+    
+    const customer = await prisma.customer.findFirst({
+      where: { 
+        id, 
+        companyId, 
+        isDeleted: false 
+      }
+    });
+    
+    if (!customer) return res.status(404).json({ success: false, message: 'Customer not found' });
+
+    const orders = await prisma.order.findMany({
+      where: { customerId: id },
+      orderBy: { createdAt: 'desc' },
+      take: 10,
+      select: { id: true, orderNumber: true, orderDate: true, grandTotal: true, orderStatus: true, paymentStatus: true }
+    });
+
+    res.status(200).json({
+      success: true,
+      data: normalizeCustomer({ ...customer, recentOrders: orders }),
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: 'Failed to fetch customer', error: error.message });
+  }
+};
+
+const getCustomerByNumber = async (req, res) => {
+  try {
+    const { customerNumber } = req.params;
+    const companyId = req.user.companyId;
+    
+    const customer = await prisma.customer.findFirst({
+      where: { 
+        customerNumber, 
+        companyId, 
+        isActive: true, 
+        isDeleted: false 
+      }
+    });
+    
+    if (!customer) return res.status(404).json({ success: false, message: 'Customer not found' });
+    res.status(200).json({ success: true, data: normalizeCustomer(customer) });
+  } catch (error) {
+    res.status(500).json({ success: false, message: 'Failed to fetch customer', error: error.message });
+  }
+};
+
+const createCustomer = async (req, res) => {
+  try {
+    const {
+      name, email, phone, company, customerType, taxId,
+      address, shippingAddress, billingAddress, status,
+      loyaltyPoints, notes, tags, preferences,
+      creditLimit, creditTerms
+    } = req.body;
+
+    const userId = req.user.id;
+    const companyId = req.user.companyId;
+
+    if (!name) return res.status(400).json({ success: false, message: 'Customer name is required' });
+
+    const normalizedEmail = normalizeEmail(email);
+
+    if (normalizedEmail) {
+      const existing = await prisma.customer.findFirst({
+        where: { 
+          email: { equals: normalizedEmail, mode: 'insensitive' },
+          companyId, 
+          isActive: true, 
+          isDeleted: false 
+        }
+      });
+      if (existing) {
+        return res.status(409).json({
+          success: false,
+          message: 'A customer with this email already exists in your company'
+        });
+      }
+    }
+
+    if (phone) {
+      const existing = await prisma.customer.findFirst({
+        where: { 
+          phone, 
+          companyId, 
+          isActive: true, 
+          isDeleted: false 
+        }
+      });
+      if (existing) return res.status(409).json({ success: false, message: 'Customer with this phone already exists' });
+    }
+
+    // customerNumber is globally unique in schema — generate from global max, not company-only
+    let customer;
+    let lastError;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const customerNumber = await generateUniqueCustomerNumber();
+      try {
+        customer = await prisma.customer.create({
+          data: {
+            customerNumber,
+            name,
+            email: normalizedEmail,
+            phone,
+            companyName: company || null,
+            customerType: customerType || 'Individual',
+            taxId: taxId || null,
+            address: address || {},
+            shippingAddress: shippingAddress || {},
+            billingAddress: billingAddress || {},
+            status: status || 'Active',
+            loyaltyPoints: loyaltyPoints || 0,
+            notes: notes || '',
+            tags: tags || [],
+            preferences: preferences || {},
+            creditLimit: creditLimit || 0,
+            creditTerms: creditTerms || 'Net 30',
+            createdBy: userId,
+            companyId: companyId
+          }
+        });
+        lastError = null;
+        break;
+      } catch (err) {
+        lastError = err;
+        const targets = err.meta?.target;
+        const isNumberClash =
+          err.code === 'P2002' &&
+          (Array.isArray(targets)
+            ? targets.includes('customer_number') || targets.includes('customerNumber')
+            : String(targets || '').includes('customer_number'));
+        if (!isNumberClash) throw err;
+      }
+    }
+
+    if (!customer) throw lastError;
+
+    res.status(201).json({
+      success: true,
+      message: 'Customer created successfully',
+      data: normalizeCustomer(customer),
+    });
+  } catch (error) {
+    console.error('Create customer error:', error);
+    if (error.code === 'P2002') {
+      const target = error.meta?.target;
+      const fields = Array.isArray(target) ? target : [String(target || '')];
+      if (fields.some((f) => String(f).includes('email'))) {
+        return res.status(409).json({
+          success: false,
+          message: 'A customer with this email already exists in your company'
+        });
+      }
+      const field = fields.join(', ');
+      return res.status(409).json({
+        success: false,
+        message: `A customer with this ${field} already exists`
+      });
+    }
+    res.status(500).json({ success: false, message: 'Failed to create customer', error: error.message });
+  }
+};
+
+const updateCustomer = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const userId = req.user.id;
+    const companyId = req.user.companyId;
+
+    const customer = await prisma.customer.findFirst({
+      where: { 
+        id, 
+        companyId, 
+        isActive: true, 
+        isDeleted: false 
+      }
+    });
+    
+    if (!customer) return res.status(404).json({ success: false, message: 'Customer not found' });
+
+    const {
+      name, email, phone, company, customerType, taxId,
+      address, shippingAddress, billingAddress, status,
+      loyaltyPoints, notes, tags, preferences, totalOrders, totalSpent, lastOrderDate
+    } = req.body;
+
+    if (email && email !== customer.email) {
+      const normalizedEmail = normalizeEmail(email);
+      const existing = await prisma.customer.findFirst({
+        where: { 
+          email: { equals: normalizedEmail, mode: 'insensitive' },
+          companyId, 
+          id: { not: id },
+          isActive: true, 
+          isDeleted: false 
+        }
+      });
+      if (existing) {
+        return res.status(409).json({
+          success: false,
+          message: 'A customer with this email already exists in your company'
+        });
+      }
+    }
+
+    if (phone && phone !== customer.phone) {
+      const existing = await prisma.customer.findFirst({
+        where: { 
+          phone, 
+          companyId, 
+          id: { not: id },
+          isActive: true, 
+          isDeleted: false 
+        }
+      });
+      if (existing) return res.status(409).json({ success: false, message: 'Phone already exists' });
+    }
+
+    const newTotalOrders = totalOrders !== undefined ? totalOrders : customer.totalOrders;
+    const newTotalSpent = totalSpent !== undefined ? totalSpent : customer.totalSpent;
+
+    const updated = await prisma.customer.update({
+      where: { id },
+      data: {
+        name: name || customer.name,
+        email: email !== undefined ? normalizeEmail(email) : customer.email,
+        phone: phone || customer.phone,
+        companyName: company !== undefined ? company : customer.companyName,
+        customerType: customerType || customer.customerType,
+        taxId: taxId !== undefined ? taxId : customer.taxId,
+        address: address || customer.address,
+        shippingAddress: shippingAddress || customer.shippingAddress,
+        billingAddress: billingAddress || customer.billingAddress,
+        status: status || customer.status,
+        loyaltyPoints: loyaltyPoints !== undefined ? loyaltyPoints : customer.loyaltyPoints,
+        notes: notes !== undefined ? notes : customer.notes,
+        tags: tags || customer.tags,
+        preferences: preferences || customer.preferences,
+        totalOrders: newTotalOrders,
+        totalSpent: newTotalSpent,
+        averageOrderValue: newTotalOrders > 0 ? newTotalSpent / newTotalOrders : 0,
+        lastOrderDate: lastOrderDate ? new Date(lastOrderDate) : customer.lastOrderDate,
+        updatedBy: userId
+      }
+    });
+
+    res.status(200).json({
+      success: true,
+      message: 'Customer updated successfully',
+      data: normalizeCustomer(updated),
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: 'Failed to update customer', error: error.message });
+  }
+};
+
+const deleteCustomer = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const userId = req.user.id;
+    const companyId = req.user.companyId;
+
+    const customer = await prisma.customer.findFirst({
+      where: { 
+        id, 
+        companyId, 
+        isActive: true, 
+        isDeleted: false 
+      }
+    });
+    
+    if (!customer) return res.status(404).json({ success: false, message: 'Customer not found' });
+
+    const ordersCount = await prisma.order.count({ 
+      where: { 
+        customerId: id,
+        isActive: true,
+        isDeleted: false
+      } 
+    });
+    
+    if (ordersCount > 0) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Cannot delete customer with existing orders.' 
+      });
+    }
+
+    await prisma.customer.update({
+      where: { id },
+      data: { isDeleted: true, isActive: false, updatedBy: userId }
+    });
+
+    res.status(200).json({ success: true, message: 'Customer deleted successfully' });
+  } catch (error) {
+    res.status(500).json({ success: false, message: 'Failed to delete customer', error: error.message });
+  }
+};
+
+const updateCustomerStatus = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { status } = req.body;
+    const userId = req.user.id;
+    const companyId = req.user.companyId;
+
+    if (!status) return res.status(400).json({ success: false, message: 'Status is required' });
+
+    const customer = await prisma.customer.findFirst({
+      where: { 
+        id, 
+        companyId, 
+        isActive: true, 
+        isDeleted: false 
+      }
+    });
+    
+    if (!customer) return res.status(404).json({ success: false, message: 'Customer not found' });
+
+    const updated = await prisma.customer.update({
+      where: { id },
+      data: { status, updatedBy: userId }
+    });
+
+    res.status(200).json({
+      success: true,
+      message: 'Status updated successfully',
+      data: normalizeCustomer(updated),
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: 'Failed to update status', error: error.message });
+  }
+};
+
+const getCustomerStats = async (req, res) => {
+  try {
+    const companyId = req.user.companyId;
+    
+    const [total, active, inactive] = await Promise.all([
+      prisma.customer.count({ where: { companyId, isDeleted: false } }),
+      prisma.customer.count({ where: { companyId, isDeleted: false, status: 'Active' } }),
+      prisma.customer.count({ where: { companyId, isDeleted: false, status: 'Inactive' } })
+    ]);
+
+    res.status(200).json({ success: true, data: { total, active, inactive } });
+  } catch (error) {
+    res.status(500).json({ success: false, message: 'Failed to fetch stats', error: error.message });
+  }
+};
+
+// ✅ FIXED: Search Customers with companyId instead of userId
+const searchCustomers = async (req, res) => {
+  try {
+    const companyId = req.user.companyId;
+    const { q, limit = 10 } = req.query;
+    
+    if (!q || q.length < 2) {
+      return res.status(200).json({ success: true, data: [], count: 0 });
+    }
+
+    const customers = await prisma.customer.findMany({
+      where: {
+        companyId: companyId,  // ✅ FIXED: Use companyId instead of userId
+        isActive: true,
+        isDeleted: false,
+        OR: [
+          { name: { contains: q, mode: 'insensitive' } },
+          { email: { contains: q, mode: 'insensitive' } },
+          { phone: { contains: q, mode: 'insensitive' } },
+          { companyName: { contains: q, mode: 'insensitive' } },
+          { customerNumber: { contains: q, mode: 'insensitive' } }
+        ]
+      },
+      take: parseInt(limit),
+      orderBy: { name: 'asc' },
+      select: {
+        id: true,
+        customerNumber: true,
+        name: true,
+        email: true,
+        phone: true,
+        companyName: true,
+        customerType: true,
+        status: true,
+        outstandingBalance: true,
+        address: true
+      }
+    });
+
+    res.status(200).json({ 
+      success: true, 
+      data: normalizeCustomers(customers), 
+      count: customers.length 
+    });
+  } catch (error) {
+    console.error('Search customers error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to search customers', 
+      error: error.message 
+    });
+  }
+};
+
+const getCustomerOrders = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const companyId = req.user.companyId;
+    const { page = 1, limit = 10 } = req.query;
+    const pageNum = parseInt(page);
+    const limitNum = parseInt(limit);
+    const skip = (pageNum - 1) * limitNum;
+
+    const customer = await prisma.customer.findFirst({
+      where: { 
+        id, 
+        companyId, 
+        isActive: true, 
+        isDeleted: false 
+      }
+    });
+    
+    if (!customer) return res.status(404).json({ success: false, message: 'Customer not found' });
+
+    const [orders, total] = await Promise.all([
+      prisma.order.findMany({
+        where: { 
+          customerId: id,
+          isActive: true,
+          isDeleted: false
+        },
+        orderBy: { createdAt: 'desc' },
+        skip, 
+        take: limitNum,
+        select: {
+          id: true, 
+          orderNumber: true, 
+          orderDate: true,
+          grandTotal: true, 
+          orderStatus: true, 
+          paymentStatus: true,
+          items: { 
+            select: { 
+              productName: true, 
+              quantity: true, 
+              totalPrice: true 
+            } 
+          }
+        }
+      }),
+      prisma.order.count({ 
+        where: { 
+          customerId: id,
+          isActive: true,
+          isDeleted: false
+        } 
+      })
+    ]);
+
+    res.status(200).json({
+      success: true, 
+      data: orders,
+      pagination: {
+        page: pageNum, 
+        limit: limitNum, 
+        total,
+        pages: Math.ceil(total / limitNum),
+        hasNext: pageNum < Math.ceil(total / limitNum),
+        hasPrev: pageNum > 1
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: 'Failed to fetch orders', error: error.message });
+  }
+};
+
+const getCustomerCreditInfo = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const companyId = req.user.companyId;
+    
+    const customer = await prisma.customer.findFirst({
+      where: { 
+        id, 
+        companyId, 
+        isActive: true, 
+        isDeleted: false 
+      },
+      select: {
+        id: true,
+        customerNumber: true,
+        name: true,
+        creditLimit: true,
+        creditTerms: true,
+        outstandingBalance: true,
+        totalSpent: true,
+        totalOrders: true
+      }
+    });
+    
+    if (!customer) return res.status(404).json({ success: false, message: 'Customer not found' });
+
+    const creditLimit = customer.creditLimit || 0;
+    const outstandingBalance = customer.outstandingBalance || 0;
+    const utilization = creditLimit > 0 ? (outstandingBalance / creditLimit) * 100 : 0;
+    const availableCredit = creditLimit - outstandingBalance;
+
+    res.status(200).json({ 
+      success: true, 
+      data: {
+        customerId: customer.id,
+        customerNumber: customer.customerNumber,
+        customerName: customer.name,
+        creditLimit,
+        creditTerms: customer.creditTerms || 'Net 30',
+        outstandingBalance,
+        utilization: Math.round(utilization * 100) / 100,
+        availableCredit,
+        totalSpent: customer.totalSpent || 0,
+        totalOrders: customer.totalOrders || 0
+      }
+    });
+  } catch (error) {
+    console.error('Get customer credit info error:', error);
+    res.status(500).json({ success: false, message: 'Failed to fetch credit info', error: error.message });
+  }
+};
+
+module.exports = {
+  getCustomers, 
+  getCustomerById, 
+  getCustomerByNumber,
+  createCustomer, 
+  updateCustomer, 
+  deleteCustomer,
+  updateCustomerStatus, 
+  getCustomerStats, 
+  searchCustomers,  
+  getCustomerOrders,
+  getCustomerCreditInfo
+};

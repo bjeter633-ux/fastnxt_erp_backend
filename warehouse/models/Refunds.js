@@ -1,0 +1,598 @@
+// warehouse/models/Refunds.js - COMPLETE CORRECTED
+
+const prisma = require('../../prisma/client');
+const { postRefundPaymentAccounting } = require('../services/salesAccountingService');
+
+// ─── Generate Refund Number Function ──────────────────────
+function generateRefundNumber(refundType) {
+  const date = new Date();
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  const random = Math.floor(Math.random() * 10000).toString().padStart(4, '0');
+  
+  let prefix = 'REF';
+  if (refundType === 'Sales Refund') prefix = 'SRF';
+  else if (refundType === 'Purchase Refund') prefix = 'PRF';
+  
+  return `${prefix}-${year}${month}${day}-${random}`;
+}
+
+class RefundModel {
+  // ============================================================
+  // CREATE REFUND (Sales or Purchase)
+  // ============================================================
+  static async create(data) {
+    const {
+      getRefundedAmountForReturn,
+      getRefundedAmountForOrder,
+    } = require('../services/salesQuantityService');
+
+    const amount = Number(data.amount) || 0;
+    if (amount <= 0) {
+      throw new Error('Refund amount must be greater than 0');
+    }
+
+    // Cap refund against return remaining or order paid/refundable context
+    if (data.returnId) {
+      const ret = await prisma.return.findUnique({ where: { id: data.returnId } });
+      if (!ret) throw new Error('Return not found');
+      const alreadyRefunded = await getRefundedAmountForReturn(data.returnId);
+      const maxRefundable = Math.max(0, (Number(ret.totalRefund) || 0) - alreadyRefunded);
+      if (amount > maxRefundable + 0.0001) {
+        throw new Error(
+          `Refund amount ${amount} exceeds remaining refundable ${maxRefundable} for return ${ret.returnNumber}`
+        );
+      }
+    }
+
+    // ✅ FIXED: Generate refund number before creating
+    const refundNumber = generateRefundNumber(data.refundType || 'Sales Refund');
+    
+    const refund = await prisma.refund.create({
+      data: {
+        refundNumber,  // ✅ Added missing refundNumber
+        refundDate: new Date(),
+        refundType: data.refundType || 'Sales Refund',
+        refundStatus: data.refundStatus || 'Pending',
+        refundMethod: data.refundMethod || 'Original Payment',
+        // Order fields (for Sales Refund)
+        orderId: data.orderId || null,
+        orderNumber: data.orderNumber || '',
+        // Purchase fields (for Purchase Refund)
+        purchaseId: data.purchaseId || null,
+        purchaseNumber: data.purchaseNumber || '',
+        // Customer fields (for Sales Refund)
+        customerId: data.customerId || null,
+        customerName: data.customerName || '',
+        customerEmail: data.customerEmail || '',
+        customerPhone: data.customerPhone || '',
+        // Supplier fields (for Purchase Refund)
+        supplierId: data.supplierId || null,
+        supplierName: data.supplierName || '',
+        supplierEmail: data.supplierEmail || '',
+        supplierPhone: data.supplierPhone || '',
+        // Return reference
+        returnId: data.returnId || null,
+        returnNumber: data.returnNumber || '',
+        // Financial
+        amount: data.amount,
+        reason: data.reason || '',
+        notes: data.notes || '',
+        referenceNumber: data.referenceNumber || '',
+        bankName: data.bankName || '',
+        accountNumber: data.accountNumber || '',
+        accountHolderName: data.accountHolderName || '',
+        attachments: data.attachments || [],
+        createdBy: data.createdBy,      // ✅ Use createdBy (not userId)
+        companyId: data.companyId,      // ✅ Use companyId
+        isActive: true,
+        isDeleted: false
+      },
+      include: {
+        creator: {
+          select: { id: true, firstName: true, lastName: true, email: true }
+        },
+        order: {
+          select: { id: true, orderNumber: true, grandTotal: true, customerName: true }
+        },
+        purchase: {
+          select: { id: true, purchaseNumber: true, grandTotal: true, supplierName: true }
+        },
+        supplier: {
+          select: { id: true, name: true, email: true, phone: true }
+        }
+      }
+    });
+
+    // Sync order payment status based on cumulative refunds vs order total
+    if (data.orderId && (data.refundType || 'Sales Refund') === 'Sales Refund') {
+      const order = await prisma.order.findUnique({ where: { id: data.orderId } });
+      if (order) {
+        const totalRefunded = await getRefundedAmountForOrder(data.orderId);
+        const orderTotal = Number(order.grandTotal) || 0;
+        let paymentStatus = 'Partial Refund';
+        if (totalRefunded >= orderTotal - 0.01) {
+          paymentStatus = 'Refunded';
+        } else if (totalRefunded <= 0) {
+          paymentStatus = order.paymentStatus;
+        }
+        await prisma.order.update({
+          where: { id: data.orderId },
+          data: { paymentStatus },
+        });
+      }
+    }
+
+    return refund;
+  }
+
+  // ============================================================
+  // GET ALL REFUNDS WITH FILTERS (by type)
+  // ============================================================
+  static async findAll(filter = {}, options = {}) {
+    const { skip, take, orderBy = { createdAt: 'desc' } } = options;
+    
+    return await prisma.refund.findMany({
+      where: filter,
+      skip,
+      take,
+      orderBy,
+      include: {
+        creator: {
+          select: { id: true, firstName: true, lastName: true, email: true }
+        },
+        processor: {
+          select: { id: true, firstName: true, lastName: true, email: true }
+        },
+        order: {
+          select: { id: true, orderNumber: true, grandTotal: true, customerName: true }
+        },
+        purchase: {
+          select: { id: true, purchaseNumber: true, grandTotal: true, supplierName: true }
+        },
+        supplier: {
+          select: { id: true, name: true, email: true, phone: true }
+        }
+      }
+    });
+  }
+
+  // ============================================================
+  // GET SALES REFUNDS ONLY
+  // ============================================================
+  static async findSalesRefunds(filter = {}, options = {}) {
+    return await this.findAll({
+      ...filter,
+      refundType: 'Sales Refund'
+    }, options);
+  }
+
+  // ============================================================
+  // GET PURCHASE REFUNDS ONLY
+  // ============================================================
+  static async findPurchaseRefunds(filter = {}, options = {}) {
+    return await this.findAll({
+      ...filter,
+      refundType: 'Purchase Refund'
+    }, options);
+  }
+
+  // ============================================================
+  // COUNT REFUNDS
+  // ============================================================
+  static async count(filter = {}) {
+    return await prisma.refund.count({ where: filter });
+  }
+
+  // ============================================================
+  // COUNT SALES REFUNDS
+  // ============================================================
+  static async countSalesRefunds(filter = {}) {
+    // ✅ FIXED: Map userId to createdBy if present
+    const cleanFilter = { ...filter };
+    if (cleanFilter.userId) {
+      cleanFilter.createdBy = cleanFilter.userId;
+      delete cleanFilter.userId;
+    }
+    
+    return await prisma.refund.count({
+      where: {
+        ...cleanFilter,
+        refundType: 'Sales Refund'
+      }
+    });
+  }
+
+  // ============================================================
+  // COUNT PURCHASE REFUNDS
+  // ============================================================
+  static async countPurchaseRefunds(filter = {}) {
+    // ✅ FIXED: Map userId to createdBy if present
+    const cleanFilter = { ...filter };
+    if (cleanFilter.userId) {
+      cleanFilter.createdBy = cleanFilter.userId;
+      delete cleanFilter.userId;
+    }
+    
+    return await prisma.refund.count({
+      where: {
+        ...cleanFilter,
+        refundType: 'Purchase Refund'
+      }
+    });
+  }
+
+  // ============================================================
+  // FIND REFUND BY ID
+  // ============================================================
+  static async findById(id) {
+    return await prisma.refund.findUnique({
+      where: { id },
+      include: {
+        creator: {
+          select: { id: true, firstName: true, lastName: true, email: true }
+        },
+        processor: {
+          select: { id: true, firstName: true, lastName: true, email: true }
+        },
+        updater: {
+          select: { id: true, firstName: true, lastName: true, email: true }
+        },
+        order: {
+          select: { id: true, orderNumber: true, grandTotal: true, customerName: true, orderDate: true }
+        },
+        purchase: {
+          select: { id: true, purchaseNumber: true, grandTotal: true, supplierName: true, purchaseDate: true }
+        },
+        supplier: {
+          select: { id: true, name: true, email: true, phone: true }
+        }
+      }
+    });
+  }
+
+  // ============================================================
+  // FIND REFUND BY REFUND NUMBER
+  // ============================================================
+  static async findByRefundNumber(refundNumber) {
+    return await prisma.refund.findUnique({
+      where: { refundNumber },
+      include: {
+        creator: {
+          select: { id: true, firstName: true, lastName: true, email: true }
+        },
+        order: {
+          select: { id: true, orderNumber: true, grandTotal: true, customerName: true }
+        },
+        purchase: {
+          select: { id: true, purchaseNumber: true, grandTotal: true, supplierName: true }
+        }
+      }
+    });
+  }
+
+  // ============================================================
+  // FIND REFUNDS BY ORDER ID
+  // ============================================================
+  static async findByOrderId(orderId) {
+    return await prisma.refund.findMany({
+      where: { 
+        orderId: orderId,
+        refundType: 'Sales Refund'
+      },
+      orderBy: { createdAt: 'desc' },
+      include: {
+        creator: {
+          select: { id: true, firstName: true, lastName: true, email: true }
+        }
+      }
+    });
+  }
+
+  // ============================================================
+  // FIND REFUNDS BY PURCHASE ID
+  // ============================================================
+  static async findByPurchaseId(purchaseId) {
+    return await prisma.refund.findMany({
+      where: { 
+        purchaseId: purchaseId,
+        refundType: 'Purchase Refund'
+      },
+      orderBy: { createdAt: 'desc' },
+      include: {
+        creator: {
+          select: { id: true, firstName: true, lastName: true, email: true }
+        }
+      }
+    });
+  }
+
+  // ============================================================
+  // UPDATE REFUND
+  // ============================================================
+  static async update(id, data) {
+    return await prisma.refund.update({
+      where: { id },
+      data,
+      include: {
+        creator: {
+          select: { id: true, firstName: true, lastName: true, email: true }
+        },
+        processor: {
+          select: { id: true, firstName: true, lastName: true, email: true }
+        }
+      }
+    });
+  }
+
+  // ============================================================
+  // PROCESS REFUND (Pending → Processing)
+  // ============================================================
+  static async process(id, userId) {
+    return await prisma.refund.update({
+      where: { id },
+      data: {
+        refundStatus: 'Processing',
+        processedBy: userId,
+        processedAt: new Date(),
+        updatedBy: userId
+      },
+      include: {
+        creator: {
+          select: { id: true, firstName: true, lastName: true, email: true }
+        },
+        processor: {
+          select: { id: true, firstName: true, lastName: true, email: true }
+        }
+      }
+    });
+  }
+
+  // ============================================================
+  // COMPLETE REFUND (Processing → Completed)
+  // ============================================================
+  static async complete(id, userId, options = {}) {
+    return await prisma.$transaction(async (tx) => {
+      const refund = await tx.refund.findUnique({ where: { id } });
+      if (!refund) throw new Error('Refund not found');
+      if (refund.refundStatus === 'Completed') {
+        return await tx.refund.findUnique({
+          where: { id },
+          include: {
+            creator: {
+              select: { id: true, firstName: true, lastName: true, email: true },
+            },
+            processor: {
+              select: { id: true, firstName: true, lastName: true, email: true },
+            },
+          },
+        });
+      }
+
+      if (refund.refundType === 'Sales Refund' || !refund.refundType) {
+        await postRefundPaymentAccounting(tx, {
+          refund,
+          userId,
+          companyId: refund.companyId,
+          bankAccountId: options.bankAccountId || null,
+        });
+      }
+
+      return await tx.refund.update({
+        where: { id },
+        data: {
+          refundStatus: 'Completed',
+          completedAt: new Date(),
+          updatedBy: userId,
+          processedBy: userId,
+          processedAt: refund.processedAt || new Date(),
+        },
+        include: {
+          creator: {
+            select: { id: true, firstName: true, lastName: true, email: true },
+          },
+          processor: {
+            select: { id: true, firstName: true, lastName: true, email: true },
+          },
+        },
+      });
+    });
+  }
+
+  // ============================================================
+  // CANCEL REFUND
+  // ============================================================
+  static async cancel(id, userId, reason = '') {
+    return await prisma.refund.update({
+      where: { id },
+      data: {
+        refundStatus: 'Cancelled',
+        failureReason: reason || 'Cancelled by user',
+        updatedBy: userId
+      },
+      include: {
+        creator: {
+          select: { id: true, firstName: true, lastName: true, email: true }
+        }
+      }
+    });
+  }
+
+  // ============================================================
+  // FAIL REFUND (Processing → Failed)
+  // ============================================================
+  static async fail(id, userId, reason) {
+    return await prisma.refund.update({
+      where: { id },
+      data: {
+        refundStatus: 'Failed',
+        failureReason: reason,
+        updatedBy: userId
+      },
+      include: {
+        creator: {
+          select: { id: true, firstName: true, lastName: true, email: true }
+        }
+      }
+    });
+  }
+
+  // ============================================================
+  // SOFT DELETE REFUND
+  // ============================================================
+  static async softDelete(id, userId) {
+    return await prisma.refund.update({
+      where: { id },
+      data: {
+        isActive: false,
+        isDeleted: true,
+        updatedBy: userId
+      }
+    });
+  }
+
+  // ============================================================
+  // GET REFUND STATS (by type) - ✅ FIXED
+  // ============================================================
+  static async getStats(companyId, refundType = null, period = 'month') {
+    // ✅ FIXED: Use companyId instead of userId
+    const now = new Date();
+    let dateFilter = {};
+
+    if (period === 'today') {
+      const start = new Date(now);
+      start.setHours(0, 0, 0, 0);
+      dateFilter = { refundDate: { gte: start } };
+    } else if (period === 'week') {
+      const start = new Date(now);
+      start.setDate(start.getDate() - 7);
+      dateFilter = { refundDate: { gte: start } };
+    } else if (period === 'month') {
+      const start = new Date(now);
+      start.setMonth(start.getMonth() - 1);
+      dateFilter = { refundDate: { gte: start } };
+    }
+
+    const filter = {
+      isActive: true,
+      isDeleted: false,
+      companyId: companyId,  // ✅ Use companyId
+      ...dateFilter
+    };
+
+    if (refundType) {
+      filter.refundType = refundType;
+    }
+
+    // Get status counts
+    const [total, pending, processing, completed, failed, cancelled] = await Promise.all([
+      prisma.refund.count({ where: filter }),
+      prisma.refund.count({ where: { ...filter, refundStatus: 'Pending' } }),
+      prisma.refund.count({ where: { ...filter, refundStatus: 'Processing' } }),
+      prisma.refund.count({ where: { ...filter, refundStatus: 'Completed' } }),
+      prisma.refund.count({ where: { ...filter, refundStatus: 'Failed' } }),
+      prisma.refund.count({ where: { ...filter, refundStatus: 'Cancelled' } })
+    ]);
+
+    // Get financial stats
+    const financial = await prisma.refund.aggregate({
+      where: filter,
+      _sum: {
+        amount: true
+      }
+    });
+
+    return {
+      total,
+      pending,
+      processing,
+      completed,
+      failed,
+      cancelled,
+      totalAmount: financial._sum.amount || 0
+    };
+  }
+
+  // ============================================================
+  // GET DAILY TREND - ✅ FIXED
+  // ============================================================
+  static async getDailyTrend(companyId, refundType = null, period = 'month') {
+    // ✅ FIXED: Use companyId instead of userId
+    const now = new Date();
+    let startDate = new Date(now);
+
+    if (period === 'today') {
+      startDate.setHours(0, 0, 0, 0);
+    } else if (period === 'week') {
+      startDate.setDate(startDate.getDate() - 7);
+    } else if (period === 'month') {
+      startDate.setMonth(startDate.getMonth() - 1);
+    }
+
+    const filter = {
+      companyId: companyId,  // ✅ Use companyId
+      isActive: true,
+      isDeleted: false,
+      refundDate: { gte: startDate }
+    };
+
+    if (refundType) {
+      filter.refundType = refundType;
+    }
+
+    const refunds = await prisma.refund.groupBy({
+      by: ['refundDate'],
+      where: filter,
+      _sum: {
+        amount: true
+      },
+      _count: true,
+      orderBy: {
+        refundDate: 'asc'
+      }
+    });
+
+    return refunds.map(item => ({
+      date: item.refundDate.toISOString().split('T')[0],
+      count: item._count,
+      amount: item._sum.amount || 0
+    }));
+  }
+
+  // ============================================================
+  // SEARCH REFUNDS - ✅ FIXED
+  // ============================================================
+  static async search(companyId, query, limit = 10) {
+    // ✅ FIXED: Use companyId instead of userId
+    if (!query || query.length < 2) {
+      return [];
+    }
+
+    return await prisma.refund.findMany({
+      where: {
+        companyId: companyId,  // ✅ Use companyId
+        isActive: true,
+        isDeleted: false,
+        OR: [
+          { refundNumber: { contains: query, mode: 'insensitive' } },
+          { orderNumber: { contains: query, mode: 'insensitive' } },
+          { purchaseNumber: { contains: query, mode: 'insensitive' } },
+          { customerName: { contains: query, mode: 'insensitive' } },
+          { customerEmail: { contains: query, mode: 'insensitive' } },
+          { supplierName: { contains: query, mode: 'insensitive' } },
+          { supplierEmail: { contains: query, mode: 'insensitive' } }
+        ]
+      },
+      take: limit,
+      orderBy: { createdAt: 'desc' },
+      include: {
+        creator: {
+          select: { id: true, firstName: true, lastName: true, email: true }
+        }
+      }
+    });
+  }
+}
+
+module.exports = RefundModel;

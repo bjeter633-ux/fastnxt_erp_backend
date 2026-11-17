@@ -1,0 +1,2433 @@
+
+const prisma = require('../prisma/client');
+const { findCashAccount } = require('../utils/cashAccountHelper');
+const {
+  normalizeLocationId,
+  salesInvoiceLocationWhere,
+  warehouseInvoiceLocationWhere,
+  purchaseInvoiceLocationWhere,
+  creditNoteLocationWhere,
+  journalEntryLocationWhere,
+  posSaleLocationWhere,
+  withLocation
+} = require('../utils/accountingLocationHelper');
+const {
+  pctChange,
+  roundPct,
+  splitBankAndCashAccounts,
+  liquidCashBalance,
+  netWorkingCapital,
+  pluralize,
+  ageOutstandingBuckets,
+  daysSalesOutstanding,
+  daysPayableOutstanding,
+  currentRatio,
+  quickRatio,
+} = require('../utils/dashboardMetricsHelper');
+const { preferInventoryAccount } = require('../warehouse/services/stockAccountingService');
+
+function formatAmount(amount) {
+  const formatter = new Intl.NumberFormat('en-US', {
+    style: 'currency',
+    currency: 'USD',
+    minimumFractionDigits: 0,
+    maximumFractionDigits: 0
+  });
+  return formatter.format(amount || 0);
+}
+
+function toNum(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : 0;
+}
+
+/** KPI change fields: null prior → change null + changeLabel New/— */
+function growthFields(current, previous, { invertPositive = false } = {}) {
+  const change = roundPct(pctChange(current, previous));
+  if (change == null) {
+    const cur = toNum(current);
+    const prev = toNum(previous);
+    return {
+      change: null,
+      changeLabel: prev === 0 && cur !== 0 ? 'New' : '—',
+      isPositive: invertPositive ? cur <= 0 : cur >= 0,
+    };
+  }
+  return {
+    change,
+    changeLabel: null,
+    isPositive: invertPositive ? change <= 0 : change >= 0,
+  };
+}
+
+/** Prefer totalAmount (includes tax) when present, else amount. */
+function docAmount(doc, preferred = 'totalAmount') {
+  if (preferred === 'totalAmount') {
+    const t = toNum(doc.totalAmount);
+    if (t > 0) return t;
+    return toNum(doc.amount);
+  }
+  const a = toNum(doc.amount);
+  if (a > 0) return a;
+  return toNum(doc.totalAmount);
+}
+
+function groupByMonth(docs, getAmount) {
+  const map = {};
+  docs.forEach((doc) => {
+    const d = new Date(doc.date);
+    if (Number.isNaN(d.getTime())) return;
+    const key = `${d.getFullYear()}-${d.getMonth()}`;
+    map[key] = (map[key] || 0) + getAmount(doc);
+  });
+  return map;
+}
+
+function inRange(dateVal, from, to) {
+  const d = new Date(dateVal);
+  return d >= from && d <= to;
+}
+
+function sumDocs(arr, getAmount) {
+  return arr.reduce((s, d) => s + getAmount(d), 0);
+}
+
+/** @deprecated use pctChange / growthFields — kept for any residual callers */
+function pct(current, previous) {
+  const v = pctChange(current, previous);
+  return v == null ? 0 : v;
+}
+
+function startOfDay(d) {
+  const x = new Date(d);
+  x.setHours(0, 0, 0, 0);
+  return x;
+}
+
+function endOfDay(d) {
+  const x = new Date(d);
+  x.setHours(23, 59, 59, 999);
+  return x;
+}
+
+function parseLocalDate(value) {
+  if (value instanceof Date) return new Date(value.getTime());
+  const raw = String(value || '').trim();
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(raw);
+  if (m) {
+    return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+  }
+  return new Date(raw);
+}
+
+function getDateRangeFromTimePeriod(timePeriod) {
+  const now = new Date();
+
+  switch (timePeriod) {
+    case 'Today':
+      return { start: startOfDay(now), end: endOfDay(now) };
+
+    case 'Last Week': {
+      const start = startOfDay(new Date(now));
+      start.setDate(start.getDate() - 6);
+      return { start, end: endOfDay(now) };
+    }
+
+    case 'This Month':
+      return {
+        start: new Date(now.getFullYear(), now.getMonth(), 1, 0, 0, 0, 0),
+        end: endOfDay(new Date(now.getFullYear(), now.getMonth() + 1, 0))
+      };
+
+    case 'Last Month':
+      return {
+        start: new Date(now.getFullYear(), now.getMonth() - 1, 1, 0, 0, 0, 0),
+        end: endOfDay(new Date(now.getFullYear(), now.getMonth(), 0))
+      };
+
+    case 'This Quarter': {
+      const quarterStartMonth = Math.floor(now.getMonth() / 3) * 3;
+      return {
+        start: new Date(now.getFullYear(), quarterStartMonth, 1, 0, 0, 0, 0),
+        end: endOfDay(new Date(now.getFullYear(), quarterStartMonth + 3, 0))
+      };
+    }
+
+    case 'This Year':
+      return {
+        start: new Date(now.getFullYear(), 0, 1, 0, 0, 0, 0),
+        end: endOfDay(new Date(now.getFullYear(), 11, 31))
+      };
+
+    case 'Custom':
+      // Custom ranges must supply startDate + endDate via resolveDateRange
+      return {
+        start: new Date(now.getFullYear(), now.getMonth(), 1, 0, 0, 0, 0),
+        end: endOfDay(now)
+      };
+
+    default:
+      return {
+        start: new Date(now.getFullYear(), now.getMonth(), 1, 0, 0, 0, 0),
+        end: endOfDay(new Date(now.getFullYear(), now.getMonth() + 1, 0))
+      };
+  }
+}
+
+/** Previous period of equal length ending just before current start. */
+function getPreviousPeriod(startDate, endDate) {
+  const durationMs = endDate.getTime() - startDate.getTime();
+  const prevEnd = new Date(startDate.getTime() - 1);
+  const prevStart = new Date(prevEnd.getTime() - durationMs);
+  return { start: prevStart, end: prevEnd };
+}
+
+/**
+ * Named periods (Today, Last Week, …) are resolved on the server so
+ * Flutter / web clients cannot drift. Custom ranges use startDate + endDate.
+ * When fiscalYearId is set, the window is clamped to that fiscal year.
+ */
+async function resolveDateRange(query = {}, companyId = null) {
+  const timePeriod = String(query.timePeriod || 'This Month').trim() || 'This Month';
+  const isCustom =
+    timePeriod === 'Custom' ||
+    timePeriod.toLowerCase() === 'custom';
+
+  let start;
+  let end;
+  let label = timePeriod;
+
+  if (isCustom && query.startDate && query.endDate) {
+    start = startOfDay(parseLocalDate(query.startDate));
+    end = endOfDay(parseLocalDate(query.endDate));
+    if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime()) || start > end) {
+      const range = getDateRangeFromTimePeriod('This Month');
+      start = range.start;
+      end = range.end;
+      label = 'This Month';
+    } else {
+      label = 'Custom';
+    }
+  } else {
+    const range = getDateRangeFromTimePeriod(timePeriod);
+    start = range.start;
+    end = range.end;
+  }
+
+  if (query.fiscalYearId && companyId) {
+    const { applyFiscalYearWindow } = require('../utils/fiscalYearHelper');
+    const clamped = await applyFiscalYearWindow({
+      companyId,
+      fiscalYearId: query.fiscalYearId,
+      start,
+      end,
+      period: label === 'Custom' ? 'Custom' : timePeriod
+    });
+    return {
+      start: clamped.start,
+      end: clamped.end,
+      timePeriod: label,
+      fiscalYearId: query.fiscalYearId,
+      empty: clamped.empty
+    };
+  }
+
+  return { start, end, timePeriod: label, fiscalYearId: query.fiscalYearId || null, empty: false };
+}
+
+function incomeAmt(d) {
+  return docAmount(d, 'totalAmount');
+}
+function expenseAmt(d) {
+  // Match ExpenseModel.getSummary — use totalAmount (tax-inclusive)
+  return toNum(d.totalAmount) || toNum(d.amount);
+}
+
+/** Same company scope as expenseController (incl. legacy null companyId rows). */
+function expenseWhere(companyId, userId, extra = {}, locationId = null) {
+  const locFilter = withLocation(locationId);
+  return {
+    OR: [
+      { companyId, ...locFilter },
+      { companyId: null, createdBy: userId, ...locFilter },
+    ],
+    status: 'Posted',
+    ...extra
+  };
+}
+
+function incomeWhere(companyId, extra = {}, locationId = null) {
+  return {
+    companyId,
+    status: 'Posted',
+    ...withLocation(locationId),
+    ...extra
+  };
+}
+function invoiceAmt(d) {
+  return toNum(d.totalAmount);
+}
+function billAmt(d) {
+  return toNum(d.totalAmount);
+}
+function creditAmt(d) {
+  return toNum(d.amount);
+}
+
+function companyInvoiceScope(companyId, userId) {
+  if (companyId) {
+    return {
+      OR: [
+        { companyId },
+        { companyId: null, createdBy: userId },
+      ]
+    };
+  }
+  return { createdBy: userId };
+}
+
+function salesInvoiceWhere(companyId, userId, extra = {}) {
+  return {
+    AND: [
+      companyInvoiceScope(companyId, userId),
+      {
+        isDeleted: false,
+        isActive: true,
+        ...extra
+      },
+    ]
+  };
+}
+
+function mergeSalesInvoiceRows(warehouseRows = [], moduleRows = []) {
+  const moduleOrderIds = new Set(
+    moduleRows.filter((r) => r.orderId).map((r) => r.orderId)
+  );
+  const filteredWarehouse = warehouseRows.filter((inv) => {
+    const status = String(inv.invoiceStatus || '');
+    if (status === 'Draft' || status === 'Cancelled') return false;
+    if (inv.orderId && moduleOrderIds.has(inv.orderId)) return false;
+    return true;
+  });
+  const filteredModule = moduleRows.filter((inv) => {
+    const status = String(inv.invoiceStatus || '');
+    return status !== 'Draft' && status !== 'Cancelled';
+  });
+  return [...filteredModule, ...filteredWarehouse];
+}
+
+/**
+ * Accounting dashboard aggregates across modules:
+ *
+ *   Sales (KPI)    ← Sales invoices grandTotal / invoiced (accrual, selected period)
+ *   Collections    ← Sales invoices paidAmount (cash collected on invoices)
+ *   Revenue        ← Sales paid + Other income − Credit notes
+ *   Purchases      ← Purchases module (PurchaseInvoice)
+ *   Other income   ← Accounting Income screen
+ *   Expenses       ← Accounting Expense screen
+ *   Credit notes   ← Accounting Credit Notes
+ *
+ *   Unpaid invoice balances are NOT included in Revenue/Sales.
+ *   They appear under Receivables (outstanding).
+ *
+ *   Ledger P&L (same as Profit & Loss screen) drives Revenue, Expenses, Net/Gross.
+ *   Depreciation and other posted JEs are included there — not only the Expense screen.
+ */
+function computePeriodTotals(
+  incomes,
+  salesInvoices,
+  creditNotes,
+  expenses,
+  purchaseInvoices,
+  start,
+  end
+) {
+  const curInc = incomes.filter((d) => inRange(d.date, start, end));
+  const curSales = salesInvoices.filter((d) => inRange(d.date, start, end));
+  const curCN = creditNotes.filter((d) => inRange(d.date, start, end));
+  const curExp = expenses.filter((d) => inRange(d.date, start, end));
+  const curPurch = purchaseInvoices.filter((d) => inRange(d.date, start, end));
+
+  const otherIncome = sumDocs(curInc, incomeAmt);
+  const salesInvoiced = sumDocs(curSales, invoiceAmt);
+  const salesPaid = curSales.reduce((s, d) => s + toNum(d.paidAmount), 0);
+  const creditNotesTotal = sumDocs(curCN, creditAmt);
+  const operatingExpenses = sumDocs(curExp, expenseAmt);
+  const purchases = sumDocs(curPurch, invoiceAmt);
+
+  const salesRevenue = salesInvoiced;
+  const revenue = salesInvoiced + otherIncome - creditNotesTotal;
+  const totalCosts = operatingExpenses;
+  const netProfit = revenue - operatingExpenses;
+  const profitMargin = revenue > 0 ? (netProfit / revenue) * 100 : 0;
+  const grossProfit = salesInvoiced - purchases;
+
+  return {
+    otherIncome,
+    salesRevenue,
+    salesInvoiced,
+    salesPaid,
+    creditNotesTotal,
+    operatingExpenses,
+    purchases,
+    revenue,
+    totalExpenses: operatingExpenses,
+    totalCosts,
+    netProfit,
+    profitMargin,
+    grossProfit
+  };
+}
+
+function purchaseWhere(companyId, userId, extra = {}) {
+  return {
+    AND: [
+      {
+        OR: [
+          { companyId },
+          { companyId: null, createdBy: userId },
+        ]
+      },
+      {
+        invoiceStatus: { notIn: ['Draft', 'Cancelled'] },
+        isDeleted: false,
+        isActive: true,
+        ...extra
+      },
+    ]
+  };
+}
+
+function groupByDay(docs, getAmount) {
+  const map = {};
+  docs.forEach((doc) => {
+    const d = new Date(doc.date);
+    if (Number.isNaN(d.getTime())) return;
+    const key = `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
+    map[key] = (map[key] || 0) + getAmount(doc);
+  });
+  return map;
+}
+
+function plKpis(pl) {
+  const revenue = toNum(pl?.revenue?.total);
+  const cogs = toNum(pl?.costOfGoodsSold);
+  const operatingExpenses = toNum(pl?.operatingExpenses?.total);
+  const otherExpenses = toNum(pl?.otherExpenses?.total);
+  const operatingProfit = toNum(pl?.grossProfit) - operatingExpenses;
+  const expenses = operatingExpenses + otherExpenses + cogs;
+  return {
+    revenue,
+    expenses,
+    cogs,
+    operatingExpenses,
+    otherExpenses,
+    operatingProfit,
+    netProfit: toNum(pl?.netProfit),
+    grossProfit: toNum(pl?.grossProfit),
+    profitMargin: toNum(pl?.netProfitMargin)
+  };
+}
+
+/** Operating & other expense categories only — COGS stays on the P&L, not this pie. */
+function buildLedgerExpenseCategories(pl) {
+  const items = [
+    ...(pl?.operatingExpenses?.items || []),
+    ...(pl?.otherExpenses?.items || [])
+  ];
+  const totalAmount = items.reduce((s, i) => s + toNum(i.amount), 0);
+  return items
+    .map((i) => ({
+      name: i.name,
+      amount: toNum(i.amount),
+      formatted: formatAmount(i.amount),
+      percentage: totalAmount > 0 ? (toNum(i.amount) / totalAmount) * 100 : 0
+    }))
+    .sort((a, b) => b.amount - a.amount);
+}
+
+function chartBuckets(startDate, endDate) {
+  const daySpan =
+    Math.floor((endDate.getTime() - startDate.getTime()) / (24 * 60 * 60 * 1000)) + 1;
+  const useDaily = daySpan <= 45;
+  const buckets = [];
+  if (useDaily) {
+    const cursor = startOfDay(startDate);
+    const last = startOfDay(endDate);
+    while (cursor <= last) {
+      buckets.push(new Date(cursor));
+      cursor.setDate(cursor.getDate() + 1);
+    }
+  } else {
+    const cursor = new Date(startDate.getFullYear(), startDate.getMonth(), 1);
+    const last = new Date(endDate.getFullYear(), endDate.getMonth(), 1);
+    while (cursor <= last) {
+      buckets.push(new Date(cursor));
+      cursor.setMonth(cursor.getMonth() + 1);
+    }
+  }
+  if (buckets.length === 0) buckets.push(startOfDay(endDate));
+  return { useDaily, buckets };
+}
+
+async function buildLedgerChartSeries(
+  companyId,
+  startDate,
+  endDate,
+  locationId = null,
+  prefetchedEntries = null
+) {
+  const windowStart = startOfDay(startDate);
+  const windowEnd = endOfDay(endDate);
+  const { useDaily, buckets } = chartBuckets(startDate, endDate);
+  const bucketKey = (d) =>
+    useDaily
+      ? `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`
+      : `${d.getFullYear()}-${d.getMonth()}`;
+  const bucketLabel = (d) =>
+    useDaily
+      ? d.toLocaleString('default', { month: 'short', day: 'numeric' })
+      : d.toLocaleString('default', { month: 'short', year: 'numeric' });
+
+  const entries =
+    prefetchedEntries ||
+    (await prisma.journalEntry.findMany({
+      where: {
+        companyId,
+        status: 'Posted',
+        date: { gte: windowStart, lte: windowEnd },
+        ...journalEntryLocationWhere(locationId),
+      },
+      include: {
+        lines: {
+          include: { account: { select: { type: true } } },
+        },
+      },
+    }));
+
+  const revMap = {};
+  const expMap = {};
+  entries.forEach((entry) => {
+    const d = new Date(entry.date);
+    if (Number.isNaN(d.getTime())) return;
+    const key = bucketKey(d);
+    (entry.lines || []).forEach((line) => {
+      const type = line.account?.type === 'Income' ? 'Revenue' : line.account?.type;
+      const debit = toNum(line.debit);
+      const credit = toNum(line.credit);
+      if (type === 'Revenue') {
+        revMap[key] = (revMap[key] || 0) + (credit - debit);
+      } else if (type === 'Expense') {
+        expMap[key] = (expMap[key] || 0) + (debit - credit);
+      }
+    });
+  });
+
+  return {
+    useDaily,
+    chartData: buckets.map((d) => {
+      const key = bucketKey(d);
+      const revenue = revMap[key] || 0;
+      const expensesTotal = expMap[key] || 0;
+      return {
+        month: bucketLabel(d),
+        date: d.toISOString(),
+        revenue,
+        expenses: expensesTotal,
+        profit: revenue - expensesTotal
+      };
+    })
+  };
+}
+
+function buildChartSeries({
+  incomes,
+  mappedSales,
+  creditNotes,
+  expenses,
+  mappedPurchases,
+  startDate,
+  endDate
+}) {
+  const daySpan =
+    Math.floor((endDate.getTime() - startDate.getTime()) / (24 * 60 * 60 * 1000)) + 1;
+  const useDaily = daySpan <= 45;
+
+  const buckets = [];
+  if (useDaily) {
+    const cursor = startOfDay(startDate);
+    const last = startOfDay(endDate);
+    while (cursor <= last) {
+      buckets.push(new Date(cursor));
+      cursor.setDate(cursor.getDate() + 1);
+    }
+  } else {
+    const cursor = new Date(startDate.getFullYear(), startDate.getMonth(), 1);
+    const last = new Date(endDate.getFullYear(), endDate.getMonth(), 1);
+    while (cursor <= last) {
+      buckets.push(new Date(cursor));
+      cursor.setMonth(cursor.getMonth() + 1);
+    }
+  }
+  if (buckets.length === 0) buckets.push(startOfDay(endDate));
+
+  const groupFn = useDaily ? groupByDay : groupByMonth;
+  const bucketKey = (d) =>
+    useDaily
+      ? `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`
+      : `${d.getFullYear()}-${d.getMonth()}`;
+  const bucketLabel = (d) =>
+    useDaily
+      ? d.toLocaleString('default', { month: 'short', day: 'numeric' })
+      : d.toLocaleString('default', { month: 'short', year: 'numeric' });
+
+  const periodIncomes = incomes.filter((d) => inRange(d.date, startDate, endDate));
+  const periodSales = mappedSales.filter((d) => inRange(d.date, startDate, endDate));
+  const periodCN = creditNotes.filter((d) => inRange(d.date, startDate, endDate));
+  const periodExp = expenses.filter((d) => inRange(d.date, startDate, endDate));
+  const periodPurch = mappedPurchases.filter((d) => inRange(d.date, startDate, endDate));
+
+  const incMap = groupFn(periodIncomes, incomeAmt);
+  const invoicedMap = groupFn(periodSales, (d) => toNum(d.totalAmount));
+  const collectedMap = groupFn(periodSales, (d) => toNum(d.paidAmount));
+  const cnMap = groupFn(periodCN, creditAmt);
+  const expMap = groupFn(periodExp, expenseAmt);
+  const purchMap = groupFn(periodPurch, invoiceAmt);
+
+  return {
+    useDaily,
+    chartData: buckets.map((d) => {
+      const key = bucketKey(d);
+      const invoiced = invoicedMap[key] || 0;
+      const collected = collectedMap[key] || 0;
+      const expensesTotal = expMap[key] || 0;
+      const purchases = purchMap[key] || 0;
+      return {
+        month: bucketLabel(d),
+        date: d.toISOString(),
+        revenue: (incMap[key] || 0) + invoiced - (cnMap[key] || 0),
+        sales: invoiced,
+        collected,
+        expenses: expensesTotal,
+        purchases,
+        profit: (incMap[key] || 0) + invoiced - (cnMap[key] || 0) - expensesTotal
+      };
+    })
+  };
+}
+
+function buildExpenseCategories(expenses, startDate, endDate) {
+  const categories = {};
+  let totalAmount = 0;
+  expenses
+    .filter((d) => inRange(d.date, startDate, endDate))
+    .forEach((exp) => {
+      const type = exp.expenseType || 'Other';
+      const amt = expenseAmt(exp);
+      categories[type] = (categories[type] || 0) + amt;
+      totalAmount += amt;
+    });
+
+  return Object.entries(categories)
+    .map(([name, amount]) => ({
+      name,
+      amount,
+      formatted: formatAmount(amount),
+      percentage: totalAmount > 0 ? (amount / totalAmount) * 100 : 0
+    }))
+    .sort((a, b) => b.amount - a.amount);
+}
+
+function buildRecentTransactions(rows, limitNum = 10) {
+  const transactions = [];
+
+  (rows.paymentsReceived || []).forEach((p) => {
+    transactions.push({
+      id: p.id,
+      title: p.reference || `Payment from ${p.customerName}`,
+      amount: toNum(p.amount),
+      date: p.paymentDate,
+      type: 'payment',
+      icon: 'payment',
+      reference: p.reference,
+      invoiceNumber: p.invoiceNumber,
+      source: 'payment_received'
+    });
+  });
+
+  (rows.incomes || []).forEach((inc) => {
+    transactions.push({
+      id: inc.id,
+      title: inc.description || `${inc.incomeType} - ${inc.incomeNumber}`,
+      amount: incomeAmt(inc),
+      date: inc.date,
+      type: 'income',
+      icon: 'trending_up',
+      reference: inc.reference,
+      source: 'income'
+    });
+  });
+
+  (rows.expenses || []).forEach((exp) => {
+    transactions.push({
+      id: exp.id,
+      title: exp.description || `${exp.expenseType} - ${exp.expenseNumber}`,
+      amount: expenseAmt(exp),
+      date: exp.date,
+      type: 'expense',
+      icon: 'trending_down',
+      reference: exp.reference,
+      source: 'expense'
+    });
+  });
+
+  (rows.invoices || []).forEach((inv) => {
+    transactions.push({
+      id: inv.id,
+      title: `Invoice to ${inv.customerName}`,
+      amount: toNum(inv.grandTotal),
+      date: inv.invoiceDate,
+      type: 'income',
+      icon: 'receipt_long',
+      reference: inv.invoiceNumber,
+      source: 'warehouse_invoice'
+    });
+  });
+
+  (rows.bills || []).forEach((bill) => {
+    transactions.push({
+      id: bill.id,
+      title: `Bill from ${bill.vendorName}`,
+      amount: toNum(bill.totalAmount),
+      date: bill.date,
+      type: 'purchase',
+      icon: 'receipt',
+      reference: bill.billNumber,
+      source: 'bill'
+    });
+  });
+
+  (rows.purchases || []).forEach((inv) => {
+    transactions.push({
+      id: inv.id,
+      title: `Purchase from ${inv.supplierName || 'Supplier'}`,
+      amount: toNum(inv.grandTotal),
+      date: inv.invoiceDate,
+      type: 'purchase',
+      icon: 'receipt',
+      reference: inv.invoiceNumber,
+      source: 'purchase_invoice'
+    });
+  });
+
+  transactions.sort((a, b) => new Date(b.date) - new Date(a.date));
+  return transactions.slice(0, limitNum);
+}
+
+function isCurrentYearEarningsName(name) {
+  return /current year earnings/i.test(String(name || ''));
+}
+
+async function buildCapitalPosition({
+  companyId,
+  userId,
+  startDate,
+  endDate,
+  fiscalYearId,
+  periodPl: periodPlIn = null,
+  locationId = null
+}) {
+  const { buildBalanceSheetFromLedger } = require('../utils/balanceSheetHelper');
+  const { buildProfitLossFromLedger } = require('../utils/profitLossHelper');
+
+  const [bs, periodPl] = await Promise.all([
+    buildBalanceSheetFromLedger(
+      userId,
+      companyId,
+      'All Time',
+      endDate,
+      fiscalYearId,
+      null,
+      null,
+      locationId
+    ),
+    periodPlIn
+      ? Promise.resolve(periodPlIn)
+      : buildProfitLossFromLedger(companyId, startDate, endDate, locationId)
+  ]);
+
+  const owners = bs.equity?.owners || [];
+  const yourCapital = owners
+    .filter((item) => {
+      const name = String(item.name || '').toLowerCase();
+      if (isCurrentYearEarningsName(item.name)) return false;
+      if (name.includes('retained')) return false;
+      if (name.includes('drawing')) return false;
+      return true;
+    })
+    .reduce((sum, item) => sum + toNum(item.balance), 0);
+  const currentEquity = toNum(bs.totals?.totalEquity);
+  const ytdEarnings = toNum(bs.equity?.retainedEarnings);
+  const periodEarnings = toNum(periodPl.netProfit);
+  const isIncrease = periodEarnings >= 0;
+
+  // Two real snapshots only — do not invent intermediate equity history.
+  const series = [
+    {
+      month: 'Capital',
+      label: 'Owner capital',
+      opening: yourCapital,
+      capital: yourCapital,
+      earnings: 0
+    },
+    {
+      month: 'Now',
+      label: 'Total equity (now)',
+      opening: yourCapital,
+      capital: currentEquity,
+      earnings: ytdEarnings
+    }
+  ];
+
+  const currentAssets = (bs.assets?.current || []).reduce(
+    (s, a) => s + toNum(a.balance),
+    0
+  );
+  const currentLiabilities = (bs.liabilities?.current || []).reduce(
+    (s, l) => s + toNum(l.balance),
+    0
+  );
+  const inventoryBalance = (bs.assets?.current || [])
+    .filter((a) => {
+      const name = String(a.name || '').toLowerCase();
+      const code = String(a.code || '');
+      const parent = String(a.parentAccount || a.parent || '').toLowerCase();
+      // Prefer true inventory; never treat Prepaid Expenses (1300) as inventory
+      if (code === '1300' || name.includes('prepaid')) return false;
+      return (
+        code === '1200' ||
+        name.includes('inventory') ||
+        name.includes('stock') ||
+        parent.includes('inventory')
+      );
+    })
+    .reduce((s, a) => s + toNum(a.balance), 0);
+
+  return {
+    openingCapital: yourCapital,
+    currentCapital: yourCapital,
+    retainedEarnings: owners
+      .filter((item) => /retained/i.test(item.name || ''))
+      .reduce((sum, item) => sum + toNum(item.balance), 0),
+    drawings: owners
+      .filter((item) => /drawing/i.test(item.name || ''))
+      .reduce((sum, item) => sum + Math.abs(toNum(item.balance)), 0),
+    bookedEarnings: ytdEarnings,
+    periodEarnings,
+    currentEquity,
+    changeOnCapital: currentEquity - yourCapital,
+    isIncrease,
+    chart: series,
+    chartNote:
+      'Snapshot comparison (owner capital vs total equity now) — not a historical time series',
+    balanceSheet: {
+      currentAssets,
+      currentLiabilities,
+      inventory: inventoryBalance,
+      totalAssets: toNum(bs.totals?.totalAssets),
+      totalLiabilities: toNum(bs.totals?.totalLiabilities),
+      totalEquity: currentEquity,
+      isBalanced: !!bs.isBalanced,
+      difference: toNum(bs.difference),
+    },
+    kpi: {
+      amount: currentEquity,
+      formatted: formatAmount(currentEquity),
+      opening: yourCapital,
+      openingFormatted: formatAmount(yourCapital),
+      periodEarnings,
+      periodEarningsFormatted: formatAmount(periodEarnings),
+      changeOnCapital: currentEquity - yourCapital,
+      changeFormatted: formatAmount(currentEquity - yourCapital),
+      isPositive: isIncrease,
+      period: 'Current'
+    }
+  };
+}
+
+async function sumEquityJournalLines(companyId, equityIds, endDate, locationId = null) {
+  if (!equityIds.length) return [];
+  const journalScope = {
+    companyId,
+    status: 'Posted',
+    date: { lte: endDate },
+    ...journalEntryLocationWhere(locationId)
+  };
+  try {
+    return await prisma.journalLine.groupBy({
+      by: ['accountId'],
+      where: {
+        accountId: { in: equityIds },
+        journal: journalScope
+      },
+      _sum: { debit: true, credit: true }
+    });
+  } catch (_) {
+    const rows = await prisma.journalLine.findMany({
+      where: {
+        accountId: { in: equityIds },
+        journal: journalScope
+      },
+      select: { accountId: true, debit: true, credit: true }
+    });
+    const map = {};
+    rows.forEach((row) => {
+      if (!map[row.accountId]) {
+        map[row.accountId] = {
+          accountId: row.accountId,
+          _sum: { debit: 0, credit: 0 }
+        };
+      }
+      map[row.accountId]._sum.debit += toNum(row.debit);
+      map[row.accountId]._sum.credit += toNum(row.credit);
+    });
+    return Object.values(map);
+  }
+}
+
+function isOwnerCapitalName(name, type) {
+  const n = String(name || '').toLowerCase();
+  const t = String(type || '').toLowerCase();
+  if (isCurrentYearEarningsName(name)) return false;
+  if (n.includes('retained') || t.includes('retained')) return false;
+  if (n.includes('drawing') || t.includes('drawing')) return false;
+  return true;
+}
+
+function buildLiteCapitalPosition(equityAccounts, lineSums, periodPl, equityModuleAccounts) {
+  const sumByAccount = {};
+  (lineSums || []).forEach((row) => {
+    sumByAccount[row.accountId] = row._sum || {};
+  });
+
+  const owners = (equityAccounts || []).map((acc) => {
+    const sums = sumByAccount[acc.id] || {};
+    const debit = toNum(sums.debit);
+    const credit = toNum(sums.credit);
+    const fromJournal = credit - debit;
+    const hasJournal = debit !== 0 || credit !== 0;
+    const balance = hasJournal
+      ? fromJournal
+      : toNum(acc.currentBalance) || toNum(acc.openingBalance);
+    return { name: acc.name, balance };
+  });
+
+  let yourCapital = owners
+    .filter((item) => isOwnerCapitalName(item.name))
+    .reduce((sum, item) => sum + toNum(item.balance), 0);
+
+  if (Math.abs(yourCapital) < 0.0001 && Array.isArray(equityModuleAccounts)) {
+    yourCapital = equityModuleAccounts
+      .filter((item) => isOwnerCapitalName(item.accountName, item.accountType))
+      .reduce(
+        (sum, item) => sum + (toNum(item.currentBalance) || toNum(item.openingBalance)),
+        0
+      );
+  }
+
+  const retainedEarnings = owners
+    .filter((item) => /retained/i.test(item.name || ''))
+    .reduce((sum, item) => sum + toNum(item.balance), 0);
+
+  const periodEarnings = toNum(periodPl?.netProfit);
+  // Equity now = owner capital + retained (incl. YTD earnings already in equity accounts).
+  // Do NOT add periodEarnings again — that double-counts current-period P&L.
+  const currentEquity = yourCapital + retainedEarnings;
+  const isIncrease = periodEarnings >= 0;
+
+  return {
+    openingCapital: yourCapital,
+    currentCapital: yourCapital,
+    retainedEarnings,
+    drawings: 0,
+    bookedEarnings: retainedEarnings,
+    periodEarnings,
+    currentEquity,
+    changeOnCapital: periodEarnings,
+    isIncrease,
+    chart: [
+      {
+        month: 'Capital',
+        label: 'Owner capital',
+        opening: yourCapital,
+        capital: yourCapital,
+        earnings: 0
+      },
+      {
+        month: 'Now',
+        label: 'Total equity (now)',
+        opening: yourCapital,
+        capital: currentEquity,
+        earnings: retainedEarnings
+      }
+    ],
+    chartNote:
+      'Snapshot comparison (owner capital vs total equity now) — not a historical time series',
+    balanceSheet: null,
+    kpi: {
+      amount: currentEquity,
+      formatted: formatAmount(currentEquity),
+      opening: yourCapital,
+      openingFormatted: formatAmount(yourCapital),
+      periodEarnings,
+      periodEarningsFormatted: formatAmount(periodEarnings),
+      changeOnCapital: periodEarnings,
+      changeFormatted: formatAmount(periodEarnings),
+      isPositive: isIncrease,
+      period: 'Current'
+    }
+  };
+}
+
+/**
+ * Single source of truth for the accounting dashboard.
+ * All KPIs, charts, categories and recent txns share the same date window.
+ */
+async function buildDashboardOverview({
+  userId,
+  companyId,
+  startDate,
+  endDate,
+  timePeriod,
+  fiscalYearId = null,
+  txnLimit = 10,
+  locationId = null
+}) {
+  const fetchFrom = startDate;
+  const fetchTo = endDate;
+  const loc = normalizeLocationId(locationId);
+  const scopedLocation = Boolean(loc);
+  const whLoc = warehouseInvoiceLocationWhere(loc);
+  const salesLoc = salesInvoiceLocationWhere(loc);
+  const purchLoc = purchaseInvoiceLocationWhere(loc);
+  const cnLoc = creditNoteLocationWhere(loc);
+
+  const emptyList = Promise.resolve([]);
+
+  const [
+    allIncomes,
+    allSalesInvoices,
+    allModuleSalesInvoices,
+    allCreditNotes,
+    allExpenses,
+    allPurchaseInvoices,
+    outstandingSalesInvoices,
+    outstandingModuleSalesInvoices,
+    outstandingBills,
+    outstandingPurchaseInvoices,
+    bankAccounts,
+    periodPaymentsReceived,
+    periodTxnIncomes,
+    periodTxnExpenses,
+    periodTxnInvoices,
+    periodTxnBills,
+    periodTxnPurchases,
+    equityAccounts,
+    equityModuleAccounts,
+  ] = await Promise.all([
+    prisma.income.findMany({
+      where: incomeWhere(companyId, {
+        date: { gte: fetchFrom, lte: fetchTo }
+      }, loc),
+      select: {
+        id: true,
+        date: true,
+        amount: true,
+        totalAmount: true,
+        description: true,
+        incomeType: true,
+        incomeNumber: true,
+        reference: true
+      }
+    }),
+    prisma.warehouseInvoice.findMany({
+      where: salesInvoiceWhere(companyId, userId, {
+        invoiceDate: { gte: fetchFrom, lte: fetchTo },
+        invoiceStatus: { notIn: ['Draft', 'Cancelled'] },
+        ...whLoc
+      }),
+      select: {
+        id: true,
+        orderId: true,
+        invoiceDate: true,
+        grandTotal: true,
+        paidAmount: true,
+        invoiceNumber: true,
+        customerName: true,
+        invoiceStatus: true
+      }
+    }),
+    prisma.salesInvoice.findMany({
+      where: salesInvoiceWhere(companyId, userId, {
+        invoiceDate: { gte: fetchFrom, lte: fetchTo },
+        invoiceStatus: { notIn: ['Draft', 'Cancelled'] },
+        ...salesLoc
+      }),
+      select: {
+        id: true,
+        orderId: true,
+        invoiceDate: true,
+        grandTotal: true,
+        paidAmount: true,
+        invoiceNumber: true,
+        customerName: true,
+        invoiceStatus: true
+      }
+    }),
+    prisma.creditNote.findMany({
+      where: {
+        companyId,
+        date: { gte: fetchFrom, lte: fetchTo },
+        status: { notIn: ['Cancelled', 'Voided'] },
+        ...cnLoc
+      },
+      select: { date: true, amount: true }
+    }),
+    prisma.expense.findMany({
+      where: expenseWhere(companyId, userId, {
+        date: { gte: fetchFrom, lte: fetchTo }
+      }, loc),
+      select: {
+        id: true,
+        date: true,
+        amount: true,
+        totalAmount: true,
+        expenseType: true,
+        description: true,
+        expenseNumber: true,
+        reference: true
+      }
+    }),
+    prisma.purchaseInvoice.findMany({
+      where: purchaseWhere(companyId, userId, {
+        invoiceDate: { gte: fetchFrom, lte: fetchTo },
+        ...purchLoc
+      }),
+      select: {
+        id: true,
+        invoiceDate: true,
+        grandTotal: true,
+        invoiceNumber: true,
+        supplierName: true
+      }
+    }),
+    prisma.warehouseInvoice.findMany({
+      where: {
+        ...salesInvoiceWhere(companyId, userId, {
+          paymentStatus: { in: ['Unpaid', 'Partial'] },
+          outstanding: { gt: 0 },
+          invoiceStatus: { notIn: ['Draft', 'Cancelled'] },
+          ...whLoc
+        })
+      },
+      select: {
+        outstanding: true,
+        orderId: true,
+        invoiceStatus: true,
+        invoiceDate: true,
+        customerName: true,
+      }
+    }),
+    prisma.salesInvoice.findMany({
+      where: {
+        ...salesInvoiceWhere(companyId, userId, {
+          paymentStatus: { in: ['Unpaid', 'Partial'] },
+          outstanding: { gt: 0 },
+          invoiceStatus: { notIn: ['Draft', 'Cancelled'] },
+          ...salesLoc
+        })
+      },
+      select: {
+        outstanding: true,
+        orderId: true,
+        invoiceStatus: true,
+        invoiceDate: true,
+        customerName: true,
+      }
+    }),
+    scopedLocation
+      ? emptyList
+      : prisma.bill.findMany({
+          where: {
+            companyId,
+            posted: true,
+            outstanding: { gt: 0 },
+            status: { notIn: ['Cancelled', 'Voided', 'Draft', 'Paid'] }
+          },
+          select: { outstanding: true, date: true }
+        }),
+    prisma.purchaseInvoice.findMany({
+      where: {
+        AND: [
+          {
+            OR: [{ companyId }, { companyId: null, createdBy: userId }]
+          },
+          {
+            paymentStatus: { in: ['Unpaid', 'Partial', 'unpaid', 'partial'] },
+            outstanding: { gt: 0 },
+            invoiceStatus: { notIn: ['Draft', 'Cancelled'] },
+            isDeleted: false,
+            isActive: true,
+            ...purchLoc
+          },
+        ]
+      },
+      select: { outstanding: true, invoiceDate: true }
+    }),
+    prisma.bankAccount.findMany({
+      where: { companyId, status: 'Active' },
+      select: {
+        id: true,
+        accountName: true,
+        bankName: true,
+        currentBalance: true,
+        accountType: true,
+        chartOfAccountId: true,
+      }
+    }),
+    // Period-scoped activity feed
+    prisma.paymentReceived.findMany({
+      where: {
+        companyId,
+        status: { notIn: ['Cancelled', 'Voided'] },
+        paymentDate: { gte: startDate, lte: endDate },
+        ...(scopedLocation ? { invoice: whLoc } : {})
+      },
+      orderBy: { paymentDate: 'desc' },
+      take: txnLimit,
+      select: {
+        id: true,
+        reference: true,
+        customerName: true,
+        amount: true,
+        paymentDate: true,
+        invoiceNumber: true
+      }
+    }),
+    prisma.income.findMany({
+      where: incomeWhere(companyId, {
+        date: { gte: startDate, lte: endDate }
+      }, loc),
+      orderBy: { date: 'desc' },
+      take: txnLimit,
+      select: {
+        id: true,
+        description: true,
+        incomeType: true,
+        incomeNumber: true,
+        amount: true,
+        totalAmount: true,
+        date: true,
+        reference: true
+      }
+    }),
+    prisma.expense.findMany({
+      where: expenseWhere(companyId, userId, {
+        date: { gte: startDate, lte: endDate }
+      }, loc),
+      orderBy: { date: 'desc' },
+      take: txnLimit,
+      select: {
+        id: true,
+        description: true,
+        expenseType: true,
+        expenseNumber: true,
+        amount: true,
+        totalAmount: true,
+        date: true,
+        reference: true
+      }
+    }),
+    prisma.warehouseInvoice.findMany({
+      where: salesInvoiceWhere(companyId, userId, {
+        invoiceDate: { gte: startDate, lte: endDate },
+        invoiceStatus: { notIn: ['Draft', 'Cancelled'] },
+        ...whLoc
+      }),
+      orderBy: { invoiceDate: 'desc' },
+      take: txnLimit,
+      select: {
+        id: true,
+        invoiceNumber: true,
+        customerName: true,
+        grandTotal: true,
+        invoiceDate: true
+      }
+    }),
+    scopedLocation
+      ? emptyList
+      : prisma.bill.findMany({
+          where: {
+            companyId,
+            posted: true,
+            status: { notIn: ['Cancelled', 'Voided', 'Draft'] },
+            date: { gte: startDate, lte: endDate }
+          },
+          orderBy: { date: 'desc' },
+          take: txnLimit,
+          select: {
+            id: true,
+            billNumber: true,
+            vendorName: true,
+            totalAmount: true,
+            date: true
+          }
+        }),
+    prisma.purchaseInvoice.findMany({
+      where: purchaseWhere(companyId, userId, {
+        invoiceDate: { gte: startDate, lte: endDate },
+        ...purchLoc
+      }),
+      orderBy: { invoiceDate: 'desc' },
+      take: txnLimit,
+      select: {
+        id: true,
+        invoiceNumber: true,
+        supplierName: true,
+        grandTotal: true,
+        invoiceDate: true
+      }
+    }),
+    prisma.chartOfAccount.findMany({
+      where: { companyId, isActive: true, type: 'Equity' },
+      select: { id: true, name: true, openingBalance: true, currentBalance: true }
+    }),
+    prisma.equityAccount.findMany({
+      where: { companyId },
+      select: {
+        accountName: true,
+        accountType: true,
+        currentBalance: true,
+        openingBalance: true
+      }
+    }),
+  ]);
+
+  const mergedSalesRows = mergeSalesInvoiceRows(
+    allSalesInvoices,
+    allModuleSalesInvoices
+  );
+  const mappedSales = mergedSalesRows.map((inv) => ({
+    date: inv.invoiceDate,
+    totalAmount: inv.grandTotal,
+    paidAmount: inv.paidAmount
+  }));
+  const mappedPurchases = allPurchaseInvoices.map((inv) => ({
+    date: inv.invoiceDate,
+    totalAmount: inv.grandTotal
+  }));
+
+  const current = computePeriodTotals(
+    allIncomes,
+    mappedSales,
+    allCreditNotes,
+    allExpenses,
+    mappedPurchases,
+    startDate,
+    endDate
+  );
+  const { buildProfitLossFromLedger } = require('../utils/profitLossHelper');
+  const equityIds = (equityAccounts || []).map((a) => a.id).filter(Boolean);
+  const windowStart = startOfDay(startDate);
+  const windowEnd = endOfDay(endDate);
+
+  const [plAccounts, journalEntries, cashAccount, posAgg, equityLineSums] =
+    await Promise.all([
+      prisma.chartOfAccount.findMany({
+        where: {
+          companyId,
+          isActive: true,
+          type: { in: ['Revenue', 'Income', 'Expense'] },
+        },
+        orderBy: { code: 'asc' },
+      }),
+      prisma.journalEntry.findMany({
+        where: {
+          companyId,
+          status: 'Posted',
+          date: { gte: windowStart, lte: windowEnd },
+          ...journalEntryLocationWhere(loc),
+        },
+        include: {
+          lines: {
+            include: {
+              account: {
+                select: { type: true, name: true, code: true, parentAccount: true },
+              },
+            },
+          },
+        },
+        orderBy: { date: 'asc' },
+      }),
+      findCashAccount(companyId),
+      prisma.pOSSale.aggregate({
+        where: {
+          companyId,
+          status: 'Completed',
+          createdAt: { gte: startDate, lte: endDate },
+          ...posSaleLocationWhere(loc),
+        },
+        _sum: { grandTotal: true, paidAmount: true },
+        _count: { id: true },
+      }),
+      equityIds.length
+        ? sumEquityJournalLines(companyId, equityIds, endDate, loc)
+        : Promise.resolve([]),
+    ]);
+
+  const [currentPl, previousPl, ledgerChart] = await Promise.all([
+    buildProfitLossFromLedger(companyId, startDate, endDate, loc, {
+      prefetchedEntries: journalEntries,
+      prefetchedAccounts: plAccounts,
+    }),
+    (() => {
+      const prev = getPreviousPeriod(startDate, endDate);
+      return buildProfitLossFromLedger(companyId, prev.start, prev.end, loc);
+    })(),
+    buildLedgerChartSeries(
+      companyId,
+      startDate,
+      endDate,
+      loc,
+      journalEntries
+    ),
+  ]);
+
+  // Balance-sheet equity (avoids double-counting period P&L into equity)
+  let capitalPosition;
+  try {
+    capitalPosition = await buildCapitalPosition({
+      companyId,
+      userId,
+      startDate,
+      endDate,
+      fiscalYearId,
+      periodPl: currentPl,
+      locationId: loc,
+    });
+  } catch (capErr) {
+    console.warn('[dashboard] buildCapitalPosition fallback:', capErr.message);
+    capitalPosition = buildLiteCapitalPosition(
+      equityAccounts,
+      equityLineSums,
+      currentPl,
+      equityModuleAccounts
+    );
+  }
+
+  const ledger = plKpis(currentPl);
+  const previousLedger = plKpis(previousPl);
+
+  const salesInPeriod = mappedSales.filter((d) => inRange(d.date, startDate, endDate));
+  const totalSalesInvoiced = salesInPeriod.reduce(
+    (s, d) => s + toNum(d.totalAmount),
+    0
+  );
+  const totalSalesCollected = salesInPeriod.reduce(
+    (s, d) => s + toNum(d.paidAmount),
+    0
+  );
+  const totalSalesCount = salesInPeriod.length;
+
+  const prevRange = getPreviousPeriod(startDate, endDate);
+  const salesPrevPeriod = mappedSales.filter((d) =>
+    inRange(d.date, prevRange.start, prevRange.end)
+  );
+  const prevSalesInvoiced = salesPrevPeriod.reduce(
+    (s, d) => s + toNum(d.totalAmount),
+    0
+  );
+  const purchasesPrevPeriod = mappedPurchases.filter((d) =>
+    inRange(d.date, prevRange.start, prevRange.end)
+  );
+  const prevPurchases = purchasesPrevPeriod.reduce(
+    (s, d) => s + toNum(d.totalAmount),
+    0
+  );
+
+  const expenseScreenTotal = current.operatingExpenses;
+  const expenseScreenCount = allExpenses.filter((d) =>
+    inRange(d.date, startDate, endDate)
+  ).length;
+  const netProfitAmount = ledger.netProfit;
+  const ledgerExpenseTotal = ledger.expenses;
+
+  const allOutstandingSales = mergeSalesInvoiceRows(
+    outstandingSalesInvoices,
+    outstandingModuleSalesInvoices
+  );
+  const totalReceivables = allOutstandingSales.reduce(
+    (s, inv) => s + toNum(inv.outstanding),
+    0
+  );
+  const billsPayable = outstandingBills.reduce(
+    (s, bill) => s + toNum(bill.outstanding),
+    0
+  );
+  const purchasePayable = outstandingPurchaseInvoices.reduce(
+    (s, inv) => s + toNum(inv.outstanding),
+    0
+  );
+  const totalPayables = billsPayable + purchasePayable;
+  const cashOnlyBalance = toNum(cashAccount?.currentBalance);
+  const bankSplit = splitBankAndCashAccounts(bankAccounts, cashAccount?.id);
+  const bankBalance = bankSplit.bankBalance;
+  const liquidCash = liquidCashBalance(cashOnlyBalance, bankBalance);
+  const posSalesAmount = toNum(posAgg._sum?.grandTotal);
+  const posSalesCount = posAgg._count?.id || 0;
+
+  const revenueGrowth = growthFields(ledger.revenue, previousLedger.revenue);
+  const expenseGrowth = growthFields(ledger.expenses, previousLedger.expenses, {
+    invertPositive: true,
+  });
+  const profitGrowth = growthFields(ledger.netProfit, previousLedger.netProfit);
+  const salesGrowth = growthFields(totalSalesInvoiced, prevSalesInvoiced);
+  const purchasesGrowth = growthFields(current.purchases, prevPurchases, {
+    invertPositive: true,
+  });
+  const grossProfitGrowth = growthFields(
+    ledger.grossProfit,
+    previousLedger.grossProfit
+  );
+
+  // Inventory from COA (prefer resolver) — no create side-effects
+  const inventoryCandidates = await prisma.chartOfAccount.findMany({
+    where: {
+      companyId,
+      isActive: true,
+      OR: [
+        { code: '1200' },
+        { name: { contains: 'Inventory', mode: 'insensitive' } },
+        { name: { contains: 'Stock', mode: 'insensitive' } },
+      ],
+    },
+    select: {
+      id: true,
+      code: true,
+      name: true,
+      currentBalance: true,
+      parentAccount: true,
+      type: true,
+    },
+  });
+  const inventoryAccount = preferInventoryAccount(inventoryCandidates);
+  const inventoryFromCoa = toNum(inventoryAccount?.currentBalance);
+
+  const bsSlice = capitalPosition?.balanceSheet || {};
+  const currentAssets =
+    bsSlice.currentAssets != null
+      ? toNum(bsSlice.currentAssets)
+      : liquidCash + inventoryFromCoa + totalReceivables;
+  const currentLiabilities =
+    bsSlice.currentLiabilities != null
+      ? toNum(bsSlice.currentLiabilities)
+      : totalPayables;
+  const inventoryBalance =
+    bsSlice.inventory != null && Math.abs(toNum(bsSlice.inventory)) > 0.005
+      ? toNum(bsSlice.inventory)
+      : inventoryFromCoa;
+  const workingCapitalAmount = netWorkingCapital({
+    currentAssets,
+    currentLiabilities,
+    cashInHand: cashOnlyBalance,
+    bankBalance,
+    inventory: inventoryBalance,
+    receivables: totalReceivables,
+    payables: totalPayables,
+  });
+  const totalAssetsAmount = toNum(bsSlice.totalAssets);
+  const totalLiabilitiesAmount = toNum(bsSlice.totalLiabilities);
+  const cr = currentRatio(currentAssets, currentLiabilities);
+  const qr = quickRatio(currentAssets, inventoryBalance, currentLiabilities);
+
+  const periodDays = Math.max(
+    1,
+    Math.floor((endDate.getTime() - startDate.getTime()) / (24 * 60 * 60 * 1000)) + 1
+  );
+  const arAging = ageOutstandingBuckets(
+    allOutstandingSales,
+    endDate,
+    'invoiceDate'
+  );
+  const apAging = ageOutstandingBuckets(
+    [
+      ...outstandingBills.map((b) => ({
+        outstanding: b.outstanding,
+        invoiceDate: b.date,
+      })),
+      ...outstandingPurchaseInvoices,
+    ],
+    endDate,
+    'invoiceDate'
+  );
+  const dso = daysSalesOutstanding(
+    totalReceivables,
+    totalSalesInvoiced,
+    periodDays
+  );
+  const dpo = daysPayableOutstanding(
+    totalPayables,
+    current.purchases,
+    periodDays
+  );
+
+  // Top customers from period sales (warehouse + module merged)
+  const customerTotals = {};
+  for (const inv of mergedSalesRows) {
+    if (!inRange(inv.invoiceDate, startDate, endDate)) continue;
+    const name = String(inv.customerName || 'Unknown').trim() || 'Unknown';
+    customerTotals[name] = (customerTotals[name] || 0) + toNum(inv.grandTotal);
+  }
+  const topCustomers = Object.entries(customerTotals)
+    .map(([name, amount]) => ({ name, amount, formatted: formatAmount(amount) }))
+    .sort((a, b) => b.amount - a.amount)
+    .slice(0, 5);
+
+  const cashNegativeWarning =
+    cashOnlyBalance < 0
+      ? {
+          severity: 'warning',
+          message:
+            'Cash in Hand ledger balance is negative. This reflects posted journal lines (or opening balance), not a dashboard calculation error. Review Cash journals / payments before posting owner capital or reversing entries. Bank overdrafts on true bank accounts are allowed separately.',
+          amount: cashOnlyBalance,
+          code: cashAccount?.code || null,
+        }
+      : null;
+
+  const { chartData: moduleChart, useDaily } = buildChartSeries({
+    incomes: allIncomes,
+    mappedSales,
+    creditNotes: allCreditNotes,
+    expenses: allExpenses,
+    mappedPurchases,
+    startDate,
+    endDate
+  });
+  const chartData = ledgerChart.chartData.map((row, i) => {
+    const moduleRow = moduleChart[i];
+    return {
+      ...row,
+      profit: toNum(row.revenue) - toNum(row.expenses),
+      salesInvoiced: moduleRow?.sales || 0,
+      salesCollected: moduleRow?.collected || 0,
+      purchases: moduleRow?.purchases || 0,
+    };
+  });
+
+  const expenseCategories = buildLedgerExpenseCategories(currentPl);
+
+  const recentTransactions = buildRecentTransactions(
+    {
+      paymentsReceived: periodPaymentsReceived,
+      incomes: periodTxnIncomes,
+      expenses: periodTxnExpenses,
+      invoices: periodTxnInvoices,
+      bills: periodTxnBills,
+      purchases: periodTxnPurchases
+    },
+    txnLimit
+  );
+
+  const chartTotals = chartData.reduce(
+    (acc, row) => {
+      acc.revenue += row.revenue;
+      acc.sales += row.sales;
+      acc.expenses += row.expenses;
+      acc.purchases += row.purchases;
+      acc.profit += row.profit;
+      return acc;
+    },
+    { revenue: 0, sales: 0, expenses: 0, purchases: 0, profit: 0 }
+  );
+
+  return {
+    kpi: {
+      totalRevenue: {
+        amount: ledger.revenue,
+        formatted: formatAmount(ledger.revenue),
+        change: revenueGrowth.change,
+        changeLabel: revenueGrowth.changeLabel,
+        isPositive: revenueGrowth.isPositive,
+        period: timePeriod,
+        sources: {
+          salesInvoiced: current.salesInvoiced,
+          salesCollected: current.salesPaid,
+          incomeModule: current.otherIncome,
+          creditNotes: current.creditNotesTotal,
+          ledgerOperating: toNum(currentPl.revenue?.operating),
+          ledgerOther: toNum(currentPl.revenue?.other),
+          formula: 'Posted ledger Revenue/Income (accrual — same as P&L)'
+        }
+      },
+      totalSales: {
+        amount: totalSalesInvoiced,
+        formatted: formatAmount(totalSalesInvoiced),
+        change: salesGrowth.change,
+        changeLabel: salesGrowth.changeLabel,
+        isPositive: salesGrowth.isPositive,
+        period: timePeriod,
+        count: totalSalesCount,
+        source: 'Sales invoices invoiced amount (accrual, selected period)'
+      },
+      salesCollections: {
+        amount: totalSalesCollected,
+        formatted: formatAmount(totalSalesCollected),
+        change: 0,
+        isPositive: true,
+        period: timePeriod,
+        count: totalSalesCount,
+        source: 'Cash collected on sales invoices (selected period)'
+      },
+      posSales: {
+        amount: posSalesAmount,
+        formatted: formatAmount(posSalesAmount),
+        change: 0,
+        isPositive: true,
+        period: timePeriod,
+        count: posSalesCount,
+        source: 'POS completed sales (selected period)'
+      },
+      totalPurchases: {
+        amount: current.purchases,
+        formatted: formatAmount(current.purchases),
+        change: purchasesGrowth.change,
+        changeLabel: purchasesGrowth.changeLabel,
+        isPositive: purchasesGrowth.isPositive,
+        period: timePeriod,
+        source: 'Purchase invoices (selected period)'
+      },
+      totalExpenses: {
+        amount: ledgerExpenseTotal,
+        formatted: formatAmount(ledgerExpenseTotal),
+        change: expenseGrowth.change,
+        changeLabel: expenseGrowth.changeLabel,
+        isPositive: expenseGrowth.isPositive,
+        period: timePeriod,
+        count: expenseScreenCount,
+        label: 'Total expenses (incl. COGS)',
+        sources: {
+          expenseModule: expenseScreenTotal,
+          operating: toNum(currentPl.operatingExpenses?.total),
+          other: toNum(currentPl.otherExpenses?.total),
+          cogs: toNum(currentPl.costOfGoodsSold),
+          formula: 'Operating + other + COGS (accrual — same as P&L); COGS also shown separately'
+        }
+      },
+      costOfGoodsSold: {
+        amount: ledger.cogs,
+        formatted: formatAmount(ledger.cogs),
+        period: timePeriod,
+        formula: 'Posted COGS ledger accounts (same as P&L)',
+        basis: 'accrual',
+      },
+      operatingExpenses: {
+        amount: ledger.operatingExpenses,
+        formatted: formatAmount(ledger.operatingExpenses),
+        period: timePeriod,
+        formula: 'Posted operating expense accounts excluding COGS',
+        basis: 'accrual',
+      },
+      operatingProfit: {
+        amount: ledger.operatingProfit,
+        formatted: formatAmount(ledger.operatingProfit),
+        isPositive: ledger.operatingProfit >= 0,
+        period: timePeriod,
+        formula: 'Gross profit − operating expenses (EBIT proxy; tax not separated)',
+        basis: 'accrual',
+      },
+      netProfit: {
+        amount: netProfitAmount,
+        formatted: formatAmount(netProfitAmount),
+        change: profitGrowth.change,
+        changeLabel: profitGrowth.changeLabel,
+        isPositive: netProfitAmount >= 0,
+        margin:
+          ledger.revenue > 0
+            ? Math.round((netProfitAmount / ledger.revenue) * 1000) / 10
+            : 0,
+        period: timePeriod,
+        formula: 'Gross profit − operating expenses − other expenses (same as P&L report)',
+        basis: 'accrual',
+      },
+      grossProfit: {
+        amount: ledger.grossProfit,
+        formatted: formatAmount(ledger.grossProfit),
+        change: grossProfitGrowth.change,
+        changeLabel: grossProfitGrowth.changeLabel,
+        isPositive: ledger.grossProfit >= 0,
+        period: timePeriod,
+        formula: 'Ledger revenue − COGS (same as P&L)'
+      },
+      outstanding: {
+        amount: totalReceivables,
+        formatted: formatAmount(totalReceivables),
+        change: 0,
+        isPositive: true,
+        count: allOutstandingSales.length,
+        period: 'Current',
+        source: 'Sales invoices outstanding (subledger · point-in-time)'
+      },
+      accountsReceivable: {
+        amount: totalReceivables,
+        formatted: formatAmount(totalReceivables),
+        change: 0,
+        isPositive: true,
+        count: allOutstandingSales.length,
+        period: 'Current',
+        basis: 'subledger',
+        source: 'Outstanding customer invoices (not GL AR control)',
+        aging: arAging,
+      },
+      accountsPayable: {
+        amount: totalPayables,
+        formatted: formatAmount(totalPayables),
+        change: 0,
+        isPositive: totalPayables === 0,
+        count: outstandingBills.length + outstandingPurchaseInvoices.length,
+        period: 'Current',
+        basis: 'subledger',
+        source: 'Outstanding bills + purchase invoices (not GL AP control)',
+        breakdown: {
+          bills: billsPayable,
+          purchaseInvoices: purchasePayable
+        },
+        aging: apAging,
+      },
+      cashBalance: {
+        amount: liquidCash,
+        formatted: formatAmount(liquidCash),
+        change: 0,
+        isPositive: liquidCash >= 0,
+        cashOnly: cashOnlyBalance,
+        bankOnly: bankBalance,
+        accountsCount: bankSplit.bankAccountsCount,
+        period: 'Current',
+        basis: 'snapshot',
+        formula: 'Cash in Hand (COA) + bank accounts excluding cash mirrors',
+      },
+      cashInHand: {
+        amount: cashOnlyBalance,
+        formatted: formatAmount(cashOnlyBalance),
+        code: cashAccount?.code || '1001',
+        name: cashAccount?.name || 'Cash in Hand',
+        isPositive: cashOnlyBalance >= 0,
+        period: 'Current',
+        basis: 'snapshot',
+        source: 'Chart of Accounts current balance',
+        warning: cashNegativeWarning,
+      },
+      bankBalance: {
+        amount: bankBalance,
+        formatted: formatAmount(bankBalance),
+        change: 0,
+        isPositive: bankBalance >= 0,
+        accountsCount: bankSplit.bankAccountsCount,
+        excludedCashMirrors: bankSplit.cashMirrorCount,
+        period: 'Current',
+        basis: 'snapshot',
+        source:
+          'Sum of active bank accounts excluding Cash-type / cash-COA-linked rows (shown under Cash)',
+      },
+      inventory: {
+        amount: inventoryBalance,
+        formatted: formatAmount(inventoryBalance),
+        code: inventoryAccount?.code || null,
+        name: inventoryAccount?.name || 'Inventory',
+        period: 'Current',
+        basis: 'snapshot',
+        source: 'Chart of Accounts / balance sheet current inventory',
+      },
+      workingCapital: {
+        amount: workingCapitalAmount,
+        formatted: formatAmount(workingCapitalAmount),
+        isPositive: workingCapitalAmount >= 0,
+        period: 'Current',
+        formula: 'Current assets − current liabilities (includes inventory when mapped)',
+        basis: 'snapshot',
+        components: {
+          currentAssets,
+          currentLiabilities,
+          cashInHand: cashOnlyBalance,
+          bank: bankBalance,
+          inventory: inventoryBalance,
+          receivables: totalReceivables,
+          payables: totalPayables,
+        },
+      },
+      totalAssets: {
+        amount: totalAssetsAmount,
+        formatted: formatAmount(totalAssetsAmount),
+        period: 'Current',
+        basis: 'ledger_balance_sheet',
+      },
+      totalLiabilities: {
+        amount: totalLiabilitiesAmount,
+        formatted: formatAmount(totalLiabilitiesAmount),
+        period: 'Current',
+        basis: 'ledger_balance_sheet',
+      },
+      currentRatio: {
+        amount: cr,
+        formatted: cr == null ? '—' : String(Math.round(cr * 100) / 100),
+        period: 'Current',
+        formula: 'Current assets ÷ current liabilities',
+      },
+      quickRatio: {
+        amount: qr,
+        formatted: qr == null ? '—' : String(Math.round(qr * 100) / 100),
+        period: 'Current',
+        formula: '(Current assets − inventory) ÷ current liabilities',
+      },
+      dso: {
+        amount: dso,
+        formatted: dso == null ? '—' : `${Math.round(dso)} days`,
+        period: timePeriod,
+        formula: '(AR ÷ credit sales) × days in period',
+      },
+      dpo: {
+        amount: dpo,
+        formatted: dpo == null ? '—' : `${Math.round(dpo)} days`,
+        period: timePeriod,
+        formula: '(AP ÷ purchases) × days in period',
+      },
+      capital: capitalPosition.kpi
+    },
+    capital: capitalPosition,
+    comparison: {
+      previousPeriod: {
+        startDate: prevRange.start.toISOString(),
+        endDate: prevRange.end.toISOString(),
+        revenue: previousLedger.revenue,
+        expenses: previousLedger.expenses,
+        netProfit: previousLedger.netProfit,
+        grossProfit: previousLedger.grossProfit,
+      },
+    },
+    accountingBasis: {
+      pnl: 'accrual',
+      pnlSource: 'Posted journal entries (same as Profit & Loss report)',
+      arAp: 'subledger',
+      cashBank: 'account_snapshot',
+      note:
+        'P&L KPIs are accrual (IFRS-style). AR/AP are open invoice balances. Cash is COA Cash in Hand; Bank excludes cash-type / cash-COA-linked BankAccount rows to prevent double counting.',
+    },
+    warnings: [cashNegativeWarning].filter(Boolean),
+    aging: { receivables: arAging, payables: apAging },
+    topCustomers,
+    ratios: {
+      currentRatio: cr,
+      quickRatio: qr,
+      dso,
+      dpo,
+      periodDays,
+    },
+    breakdown: {
+      salesRevenue: current.salesRevenue,
+      salesInvoiced: totalSalesInvoiced,
+      salesCollected: totalSalesCollected,
+      otherIncome: current.otherIncome,
+      creditNotes: current.creditNotesTotal,
+      purchases: current.purchases,
+      operatingExpenses: current.operatingExpenses,
+      expenseScreenTotal,
+      ledgerExpenses: ledgerExpenseTotal,
+      cogs: ledger.cogs,
+      operatingProfit: ledger.operatingProfit,
+      receivables: totalReceivables,
+      payables: totalPayables,
+      billsPayable,
+      purchasePayable,
+      bankBalance,
+      cashOnlyBalance,
+      liquidCash,
+      inventory: inventoryBalance,
+      workingCapital: workingCapitalAmount,
+      currentAssets,
+      currentLiabilities,
+      totalAssets: totalAssetsAmount,
+      totalLiabilities: totalLiabilitiesAmount,
+      bankAccountsCount: bankSplit.bankAccountsCount,
+      cashMirrorBankRowsExcluded: bankSplit.cashMirrorCount,
+    },
+    weeklyData: {
+      revenue: ledger.revenue,
+      expenses: ledgerExpenseTotal,
+      profit: netProfitAmount
+    },
+    dailyData: {
+      revenue: ledger.revenue,
+      expenses: ledgerExpenseTotal,
+      profit: netProfitAmount
+    },
+    chartData,
+    chartMeta: {
+      granularity: useDaily ? 'daily' : 'monthly',
+      totals: chartTotals
+    },
+    expenseCategories,
+    recentTransactions,
+    period: {
+      timePeriod,
+      startDate: startDate.toISOString(),
+      endDate: endDate.toISOString(),
+      startDateLocal: `${startDate.getFullYear()}-${String(startDate.getMonth() + 1).padStart(2, '0')}-${String(startDate.getDate()).padStart(2, '0')}`,
+      endDateLocal: `${endDate.getFullYear()}-${String(endDate.getMonth() + 1).padStart(2, '0')}-${String(endDate.getDate()).padStart(2, '0')}`
+    }
+  };
+}
+
+// ─── Get Dashboard Overview (single API) ───────────────────────
+
+const getDashboardOverview = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const companyId = req.companyIdFilter ?? req.user.companyId;
+    const {
+      start: startDate,
+      end: endDate,
+      timePeriod,
+      fiscalYearId,
+      empty,
+    } = await resolveDateRange(req.query, companyId);
+    const txnLimit = parseInt(req.query.limit, 10) || 10;
+    const locationId = req.query.locationId || null;
+
+    if (empty) {
+      return res.status(200).json({
+        success: true,
+        data: {
+          kpi: {},
+          capital: null,
+          chartData: [],
+          expenseCategories: [],
+          recentTransactions: [],
+          period: {
+            timePeriod,
+            startDate: startDate?.toISOString?.() || null,
+            endDate: endDate?.toISOString?.() || null,
+            empty: true,
+          },
+          accountingBasis: {
+            pnl: 'accrual',
+            note: 'Selected fiscal year window is empty (e.g. future FY).',
+          },
+        },
+        message: 'No data for this fiscal year window',
+      });
+    }
+
+    const data = await buildDashboardOverview({
+      userId,
+      companyId,
+      startDate,
+      endDate,
+      timePeriod,
+      fiscalYearId,
+      txnLimit,
+      locationId
+    });
+
+    return res.status(200).json({ success: true, data });
+  } catch (error) {
+    console.error('Error getting dashboard overview:', error);
+    return res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+
+const getDashboardSummary = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const companyId = req.companyIdFilter ?? req.user.companyId;
+    const { start: startDate, end: endDate, timePeriod, fiscalYearId } = await resolveDateRange(
+      req.query,
+      companyId
+    );
+    const locationId = req.query.locationId || null;
+
+    const overview = await buildDashboardOverview({
+      userId,
+      companyId,
+      startDate,
+      endDate,
+      timePeriod,
+      fiscalYearId,
+      locationId
+    });
+
+    const summaryData = {
+      kpi: overview.kpi,
+      breakdown: overview.breakdown,
+      weeklyData: overview.weeklyData,
+      dailyData: overview.dailyData,
+      period: overview.period
+    };
+
+    res.status(200).json({
+      success: true,
+      data: summaryData
+    });
+  } catch (error) {
+    console.error('Error getting dashboard summary:', error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+
+const getChartData = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const companyId = req.companyIdFilter ?? req.user.companyId;
+    const { start: startDate, end: endDate, timePeriod, fiscalYearId } = await resolveDateRange(
+      req.query,
+      companyId
+    );
+    const locationId = req.query.locationId || null;
+
+    const overview = await buildDashboardOverview({
+      userId,
+      companyId,
+      startDate,
+      endDate,
+      timePeriod,
+      fiscalYearId,
+      locationId
+    });
+
+    res.status(200).json({
+      success: true,
+      data: overview.chartData
+    });
+  } catch (error) {
+    console.error('Error getting chart data:', error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// ─── Get Expense Categories ────────────────────────────────────
+
+const getExpenseCategories = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const companyId = req.companyIdFilter ?? req.user.companyId;
+    const { start: startDate, end: endDate, timePeriod, fiscalYearId } = await resolveDateRange(
+      req.query,
+      companyId
+    );
+    const locationId = req.query.locationId || null;
+
+    const overview = await buildDashboardOverview({
+      userId,
+      companyId,
+      startDate,
+      endDate,
+      timePeriod,
+      fiscalYearId,
+      locationId
+    });
+
+    res.status(200).json({
+      success: true,
+      data: overview.expenseCategories
+    });
+  } catch (error) {
+    console.error('Error getting expense categories:', error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// ─── Get Recent Transactions ───────────────────────────────────
+
+const getRecentTransactions = async (req, res) => {
+  try {
+    const { limit = 10 } = req.query;
+    const limitNum = parseInt(limit, 10) || 10;
+    const userId = req.user.id;
+    const companyId = req.companyIdFilter ?? req.user.companyId;
+    const loc = normalizeLocationId(req.query.locationId);
+
+    const [paymentsReceived, incomes, expenses, invoices, bills] = await Promise.all([
+      prisma.paymentReceived.findMany({
+        where: { companyId, status: { notIn: ['Cancelled', 'Voided'] } },
+        orderBy: { paymentDate: 'desc' },
+        take: limitNum,
+        select: {
+          id: true,
+          reference: true,
+          customerName: true,
+          amount: true,
+          paymentDate: true,
+          invoiceNumber: true
+        }
+      }),
+      prisma.income.findMany({
+        where: incomeWhere(companyId, {}, loc),
+        orderBy: { date: 'desc' },
+        take: limitNum,
+        select: {
+          id: true,
+          description: true,
+          incomeType: true,
+          incomeNumber: true,
+          amount: true,
+          totalAmount: true,
+          date: true,
+          reference: true
+        }
+      }),
+      prisma.expense.findMany({
+        where: expenseWhere(companyId, userId, {}, loc),
+        orderBy: { date: 'desc' },
+        take: limitNum,
+        select: {
+          id: true,
+          description: true,
+          expenseType: true,
+          expenseNumber: true,
+          amount: true,
+          totalAmount: true,
+          date: true,
+          reference: true
+        }
+      }),
+      prisma.warehouseInvoice.findMany({
+        where: {
+          companyId,
+          invoiceStatus: { notIn: ['Draft', 'Cancelled'] },
+          isDeleted: false
+        },
+        orderBy: { invoiceDate: 'desc' },
+        take: limitNum,
+        select: {
+          id: true,
+          invoiceNumber: true,
+          customerName: true,
+          grandTotal: true,
+          invoiceDate: true
+        }
+      }),
+      prisma.bill.findMany({
+        where: {
+          companyId,
+          posted: true,
+          status: { notIn: ['Cancelled', 'Voided', 'Draft'] }
+        },
+        orderBy: { date: 'desc' },
+        take: limitNum,
+        select: {
+          id: true,
+          billNumber: true,
+          vendorName: true,
+          totalAmount: true,
+          date: true
+        }
+      }),
+    ]);
+
+    const transactions = [];
+
+    paymentsReceived.forEach((p) => {
+      transactions.push({
+        id: p.id,
+        title: p.reference || `Payment from ${p.customerName}`,
+        amount: toNum(p.amount),
+        date: p.paymentDate,
+        type: 'payment',
+        icon: 'payment',
+        reference: p.reference,
+        invoiceNumber: p.invoiceNumber,
+        source: 'payment_received'
+      });
+    });
+
+    incomes.forEach((inc) => {
+      transactions.push({
+        id: inc.id,
+        title: inc.description || `${inc.incomeType} - ${inc.incomeNumber}`,
+        amount: incomeAmt(inc),
+        date: inc.date,
+        type: 'income',
+        icon: 'trending_up',
+        reference: inc.reference,
+        source: 'income'
+      });
+    });
+
+    expenses.forEach((exp) => {
+      transactions.push({
+        id: exp.id,
+        title: exp.description || `${exp.expenseType} - ${exp.expenseNumber}`,
+        amount: expenseAmt(exp),
+        date: exp.date,
+        type: 'expense',
+        icon: 'trending_down',
+        reference: exp.reference,
+        source: 'expense'
+      });
+    });
+
+    invoices.forEach((inv) => {
+      transactions.push({
+        id: inv.id,
+        title: `Invoice to ${inv.customerName}`,
+        amount: toNum(inv.grandTotal),
+        date: inv.invoiceDate,
+        type: 'income',
+        icon: 'receipt_long',
+        reference: inv.invoiceNumber,
+        source: 'warehouse_invoice'
+      });
+    });
+
+    bills.forEach((bill) => {
+      transactions.push({
+        id: bill.id,
+        title: `Bill from ${bill.vendorName}`,
+        amount: toNum(bill.totalAmount),
+        date: bill.date,
+        type: 'purchase',
+        icon: 'receipt',
+        reference: bill.billNumber,
+        source: 'bill'
+      });
+    });
+
+    transactions.sort((a, b) => new Date(b.date) - new Date(a.date));
+    const recentTransactions = transactions.slice(0, limitNum);
+
+    res.status(200).json({
+      success: true,
+      data: recentTransactions
+    });
+  } catch (error) {
+    console.error('Error getting recent transactions:', error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// ─── Get Quick Actions ────────────────────────────────────────
+
+const getQuickActions = async (req, res) => {
+  res.status(200).json({
+    success: true,
+    data: [
+      { id: 'add_income', label: 'Income', icon: 'add_circle_outline', color: '#2ECC71', route: '/income' },
+      { id: 'add_expense', label: 'Expense', icon: 'remove_circle_outline', color: '#E74C3C', route: '/expense' },
+      { id: 'create_invoice', label: 'Invoice', icon: 'receipt_long', color: '#3498DB', route: '/invoices' },
+      { id: 'record_payment', label: 'Payment', icon: 'payment', color: '#F39C12', route: '/payments' },
+      { id: 'add_customer', label: 'Customer', icon: 'person_add', color: '#9B59B6', route: '/customers' },
+    ]
+  });
+};
+
+
+const getYearlySummary = async (req, res) => {
+  try {
+    const { year = new Date().getFullYear() } = req.query;
+    const userId = req.user.id;
+    const companyId = req.companyIdFilter ?? req.user.companyId;
+    const y = parseInt(year, 10);
+    const startDate = new Date(y, 0, 1, 0, 0, 0, 0);
+    const endDate = endOfDay(new Date(y, 11, 31));
+
+    const [incomes, invoices, creditNotes, expenses] = await Promise.all([
+      prisma.income.findMany({
+        where: {
+          companyId,
+          date: { gte: startDate, lte: endDate },
+          status: 'Posted'
+        },
+        select: { date: true, amount: true, totalAmount: true }
+      }),
+      prisma.warehouseInvoice.findMany({
+        where: {
+          companyId,
+          invoiceDate: { gte: startDate, lte: endDate },
+          invoiceStatus: { notIn: ['Draft', 'Cancelled'] },
+          isDeleted: false
+        },
+        select: { invoiceDate: true, grandTotal: true }
+      }),
+      prisma.creditNote.findMany({
+        where: {
+          companyId,
+          date: { gte: startDate, lte: endDate },
+          status: { notIn: ['Cancelled', 'Voided'] }
+        },
+        select: { date: true, amount: true }
+      }),
+      prisma.expense.findMany({
+        where: expenseWhere(companyId, userId, {
+          date: { gte: startDate, lte: endDate }
+        }),
+        select: { date: true, amount: true, totalAmount: true }
+      }),
+    ]);
+
+    const mappedInvoices = invoices.map((inv) => ({
+      date: inv.invoiceDate,
+      totalAmount: inv.grandTotal
+    }));
+
+    const incMap = groupByMonth(incomes, incomeAmt);
+    const invMap = groupByMonth(mappedInvoices, invoiceAmt);
+    const cnMap = groupByMonth(creditNotes, creditAmt);
+    const expMap = groupByMonth(expenses, expenseAmt);
+
+    const monthNames = [
+      'January', 'February', 'March', 'April', 'May', 'June',
+      'July', 'August', 'September', 'October', 'November', 'December',
+    ];
+
+    const monthlyData = monthNames.map((name, m) => {
+      const key = `${y}-${m}`;
+      const revenue = (incMap[key] || 0) + (invMap[key] || 0) - (cnMap[key] || 0);
+      const expensesTotal = expMap[key] || 0;
+      return {
+        month: name,
+        revenue,
+        expenses: expensesTotal,
+        profit: revenue - expensesTotal
+      };
+    });
+
+    const totalRevenue = monthlyData.reduce((s, m) => s + m.revenue, 0);
+    const totalExpenses = monthlyData.reduce((s, m) => s + m.expenses, 0);
+
+    const summaryData = {
+      year: y,
+      totalRevenue,
+      totalExpenses,
+      totalProfit: totalRevenue - totalExpenses,
+      monthlyData
+    };
+
+    res.status(200).json({
+      success: true,
+      data: summaryData
+    });
+  } catch (error) {
+    console.error('Error getting yearly summary:', error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+module.exports = {
+  getDashboardOverview,
+  getDashboardSummary,
+  getChartData,
+  getExpenseCategories,
+  getRecentTransactions,
+  getQuickActions,
+  getYearlySummary
+};

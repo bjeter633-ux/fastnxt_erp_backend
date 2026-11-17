@@ -1,0 +1,1031 @@
+// warehouse/models/SalesPaymentReceived.js - COMPLETE WITH AUTO-CREATE
+
+const crypto = require('crypto');
+const prisma = require('../../prisma/client');
+const BalanceCalculator = require('../../utils/balanceCalculator');
+const { getOrCreateCashAccount } = require('../../utils/cashAccountHelper');
+const { getOrCreateArAccount } = require('../../utils/arAccountHelper');
+
+// ─── Generate Payment Number ──────────────────────────────
+function generatePaymentNumber() {
+  const date = new Date();
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  const random = Math.floor(Math.random() * 10000).toString().padStart(4, '0');
+  return `SP-${year}${month}${day}-${random}`;
+}
+
+function paymentFingerprint({ companyId, customerId, amount, invoicePayments }) {
+  const parts = (invoicePayments || [])
+    .map((ip) => `${ip.invoiceId}:${Number(ip.amountPaid) || 0}`)
+    .sort()
+    .join('|');
+  const raw = `${companyId}|${customerId}|${Number(amount) || 0}|${parts}`;
+  return crypto.createHash('sha256').update(raw).digest('hex').slice(0, 24);
+}
+
+const PAYMENT_INCLUDE = {
+  invoicePayments: { include: { invoice: true } },
+  customer: true,
+  bankAccount: true,
+  journalEntry: {
+    include: { lines: { include: { account: true } } },
+  },
+};
+
+class SalesPaymentReceivedModel {
+  static async getCustomerInvoices(customerId, companyId, locationId) {
+    const invoices = await prisma.salesInvoice.findMany({
+      where: {
+        customerId: customerId,
+        ...(companyId ? { OR: [{ companyId: companyId }, { companyId: null }] } : {}),
+        isActive: true,
+        isDeleted: false,
+        invoiceStatus: {
+          notIn: ['Paid', 'Cancelled']
+        }
+      },
+      orderBy: {
+        invoiceDate: 'asc'
+      },
+      include: {
+        items: true,
+        invoicePayments: {
+          where: {
+            payment: {
+              isActive: true,
+              isDeleted: false,
+              status: 'Completed'
+            }
+          }
+        }
+      }
+    });
+
+    const invoicesWithOutstanding = invoices.map(invoice => {
+      const paymentsSum = invoice.invoicePayments?.reduce((sum, ip) => sum + (Number(ip.amountPaid) || 0), 0) || 0;
+      const totalPaid = Math.max(Number(invoice.paidAmount) || 0, paymentsSum);
+      const grandTotal = Number(invoice.grandTotal) || 0;
+      const outstanding = Math.max(0, grandTotal - totalPaid);
+
+      return {
+        ...invoice,
+        paidAmount: totalPaid,
+        outstanding: outstanding
+      };
+    });
+
+    return invoicesWithOutstanding.filter(inv => inv.outstanding > 0.01);
+  }
+
+  // ============================================================
+  // RECEIVE PAYMENT AGAINST INVOICES
+  // ============================================================
+  static async receivePayment(data) {
+    const paymentNumber = generatePaymentNumber();
+
+    return await prisma.$transaction(async (tx) => {
+      const {
+        customerId,
+        customerName,
+        amount,
+        paymentMethod,
+        bankAccountId,
+        bankAccountName,
+        reference,
+        notes,
+        invoicePayments,
+        userId,
+        createdBy,
+        companyId,
+        idempotencyKey,
+      } = data;
+
+      // ─── Validation ──────────────────────────────────────
+      if (!customerId) {
+        throw new Error('Customer is required');
+      }
+
+      if (!invoicePayments || invoicePayments.length === 0) {
+        throw new Error('At least one invoice must be selected');
+      }
+
+      if (!amount || amount <= 0) {
+        throw new Error('Payment amount must be greater than 0');
+      }
+
+      // ─── Idempotency (client key and/or allocation fingerprint) ─
+      const fp = paymentFingerprint({
+        companyId,
+        customerId,
+        amount,
+        invoicePayments,
+      });
+      const idemTag = idempotencyKey
+        ? `[idem:${String(idempotencyKey).slice(0, 64)}]`
+        : null;
+      const fpTag = `[fp:${fp}]`;
+
+      if (idemTag) {
+        const byKey = await tx.salesPaymentReceived.findFirst({
+          where: {
+            companyId,
+            isDeleted: false,
+            status: 'Completed',
+            notes: { contains: idemTag },
+          },
+          include: PAYMENT_INCLUDE,
+        });
+        if (byKey) return byKey;
+
+        const jeByKey = await tx.journalEntry.findFirst({
+          where: {
+            companyId,
+            reference: `SP-IDEM:${idempotencyKey}`,
+            status: 'Posted',
+          },
+        });
+        if (jeByKey) {
+          const pay = await tx.salesPaymentReceived.findFirst({
+            where: { journalEntryId: jeByKey.id },
+            include: PAYMENT_INCLUDE,
+          });
+          if (pay) return pay;
+        }
+      }
+
+      // Short-window duplicate guard for double-clicks without client key
+      const recentDup = await tx.salesPaymentReceived.findFirst({
+        where: {
+          companyId,
+          customerId,
+          amount: Number(amount),
+          isDeleted: false,
+          status: 'Completed',
+          notes: { contains: fpTag },
+          createdAt: { gte: new Date(Date.now() - 2 * 60 * 1000) },
+        },
+        include: PAYMENT_INCLUDE,
+      });
+      if (recentDup) return recentDup;
+
+      // ─── Validate Customer ──────────────────────────────
+      const customer = await tx.customer.findFirst({
+        where: {
+          id: customerId,
+          companyId: companyId,
+          isActive: true,
+          isDeleted: false
+        }
+      });
+
+      if (!customer) {
+        throw new Error('Customer not found');
+      }
+      if (paymentMethod === 'Bank Transfer' || paymentMethod === 'Cheque') {
+        if (!bankAccountId) {
+          throw new Error('Bank account is required for this payment method');
+        }
+
+        const bankAccount = await tx.bankAccount.findFirst({
+          where: {
+            id: bankAccountId,
+            companyId: companyId,
+            status: 'Active'
+          }
+        });
+
+        if (!bankAccount) {
+          throw new Error('Bank account not found');
+        }
+      }
+      let totalPaidAmount = 0;
+      const validatedInvoices = [];
+
+      for (const inv of invoicePayments) {
+        const invoice = await tx.salesInvoice.findFirst({
+          where: {
+            id: inv.invoiceId,
+            customerId: customerId,
+            companyId: companyId,
+            isActive: true,
+            isDeleted: false,
+            invoiceStatus: {
+              notIn: ['Paid', 'Cancelled']
+            }
+          },
+          include: {
+            arAccount: true,
+            invoicePayments: {
+              where: {
+                payment: {
+                  isActive: true,
+                  isDeleted: false,
+                  status: 'Completed'
+                }
+              }
+            }
+          }
+        });
+
+        if (!invoice) {
+          throw new Error(`Invoice ${inv.invoiceNumber} not found or cannot be paid`);
+        }
+
+        const totalPaid = invoice.invoicePayments?.reduce((sum, ip) => sum + ip.amountPaid, 0) || 0;
+        const currentOutstanding = invoice.grandTotal - totalPaid;
+
+        if (currentOutstanding <= 0) {
+          throw new Error(`Invoice ${inv.invoiceNumber} is already fully paid`);
+        }
+
+        if (inv.amountPaid > currentOutstanding) {
+          throw new Error(
+            `Amount ${inv.amountPaid} exceeds outstanding amount ${currentOutstanding} for invoice ${inv.invoiceNumber}`
+          );
+        }
+
+        totalPaidAmount += inv.amountPaid;
+        validatedInvoices.push({
+          invoice,
+          amountPaid: inv.amountPaid,
+          currentOutstanding,
+          totalPaid
+        });
+      }
+
+      // ─── Validate Total Amount ──────────────────────────
+      if (Math.abs(totalPaidAmount - amount) > 0.01) {
+        throw new Error('Total paid amount does not match invoice amounts');
+      }
+
+      const SalesInvoice = require('./SalesInvoice');
+      for (const inv of validatedInvoices) {
+        if (!inv.invoice.journalEntryId) {
+          await SalesInvoice.postInvoice(inv.invoice.id, userId || createdBy, tx);
+          const refreshed = await tx.salesInvoice.findUnique({
+            where: { id: inv.invoice.id },
+            include: { arAccount: true }
+          });
+          if (refreshed) inv.invoice = refreshed;
+        }
+      }
+
+      const arAccount = await getOrCreateArAccount(userId || createdBy, companyId, tx);
+      const invoiceAr = validatedInvoices[0]?.invoice?.arAccount;
+      const creditArAccount =
+        invoiceAr && String(invoiceAr.code) !== '1200'
+          ? invoiceAr
+          : arAccount;
+
+      // ─── Get or Create Cash Account ────────────────────────
+      const cashAccount = await getOrCreateCashAccount(
+        userId || createdBy,
+        companyId,
+        tx
+      );
+      if (!cashAccount) {
+        throw new Error('Cash in Hand account not found. Cannot record cash payment.');
+      }
+
+      // ─── Get Bank Account (non-cash methods only) ──────────
+      const isCash = String(paymentMethod || 'Cash').toLowerCase() === 'cash';
+      let bankAccount = null;
+      if (!isCash && bankAccountId) {
+        bankAccount = await tx.bankAccount.findFirst({
+          where: {
+            id: bankAccountId,
+            companyId: companyId,
+            status: 'Active'
+          }
+        });
+
+        if (!bankAccount) {
+          throw new Error('Bank account not found');
+        }
+      }
+
+      // ─── Resolve Debit Account: Cash in Hand (1001) for cash ─
+      let debitAccountId = cashAccount.id;
+      let debitAccountName = cashAccount.name;
+      let debitAccountCode = cashAccount.code;
+
+      if (!isCash && bankAccount?.chartOfAccountId) {
+        const bankGLAccount = await tx.chartOfAccount.findUnique({
+          where: { id: bankAccount.chartOfAccountId }
+        });
+        if (bankGLAccount) {
+          debitAccountId = bankGLAccount.id;
+          debitAccountName = bankGLAccount.name;
+          debitAccountCode = bankGLAccount.code;
+        }
+      }
+
+      // ─── Create Journal Entry (idempotent reference when keyed) ─
+      const entryNumber = `JE-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
+      const jeReference = idempotencyKey
+        ? `SP-IDEM:${idempotencyKey}`
+        : paymentNumber;
+
+      const existingJe = await tx.journalEntry.findFirst({
+        where: { companyId, reference: jeReference, status: 'Posted' },
+        include: { lines: { include: { account: true } } },
+      });
+      if (existingJe) {
+        const existingPay = await tx.salesPaymentReceived.findFirst({
+          where: { journalEntryId: existingJe.id },
+          include: PAYMENT_INCLUDE,
+        });
+        if (existingPay) return existingPay;
+      }
+
+      const journalEntry = existingJe || await tx.journalEntry.create({
+        data: {
+          entryNumber,
+          date: new Date(),
+          description: `Sales payment received from ${customer.name} (${paymentNumber})`,
+          reference: jeReference,
+          status: 'Posted',
+          createdBy: createdBy,
+          postedBy: createdBy,
+          postedAt: new Date(),
+          companyId: companyId,
+          fiscalYearId: data.fiscalYearId,
+          lines: {
+            create: [
+              {
+                accountId: debitAccountId,
+                accountName: debitAccountName,
+                accountCode: debitAccountCode,
+                debit: amount,
+                credit: 0
+              },
+              {
+                accountId: creditArAccount.id,
+                accountName: creditArAccount.name,
+                accountCode: creditArAccount.code,
+                debit: 0,
+                credit: amount
+              }
+            ]
+          }
+        },
+        include: {
+          lines: {
+            include: {
+              account: true
+            }
+          }
+        }
+      });
+
+      // Keep Chart of Accounts balances in sync with the JE
+      if (!existingJe) {
+        await BalanceCalculator.applyJournalLines(tx, journalEntry.lines);
+      }
+
+      // ─── Get AR Record for first invoice ─────────────────
+      const firstInvoice = validatedInvoices[0].invoice;
+      const arRecord = await tx.accountsReceivable.findFirst({
+        where: {
+          invoiceId: firstInvoice.id
+        }
+      });
+
+      const noteParts = [notes || '', fpTag];
+      if (idemTag) noteParts.push(idemTag);
+      const mergedNotes = noteParts.filter(Boolean).join(' ').trim();
+
+      // ─── Create Payment Record ───────────────────────────
+      const payment = await tx.salesPaymentReceived.create({
+        data: {
+          paymentNumber,
+          paymentDate: data.paymentDate ? new Date(data.paymentDate) : new Date(),
+          customerId: customerId,
+          customerName: customer.name,
+          amount: amount,
+          paymentMethod: paymentMethod || 'Cash',
+          reference: reference || '',
+          bankAccountId: bankAccount?.id || null,
+          bankAccountName: bankAccount?.accountName || 'Cash',
+          notes: mergedNotes,
+          status: 'Completed',
+          journalEntryId: journalEntry.id,
+          arRecordId: arRecord?.id || null,
+          createdBy: createdBy,
+          companyId: companyId,
+          fiscalYearId: data.fiscalYearId,
+          invoicePayments: {
+            create: invoicePayments.map(inv => ({
+              invoiceId: inv.invoiceId,
+              invoiceNumber: inv.invoiceNumber,
+              amountPaid: inv.amountPaid
+            }))
+          }
+        },
+        include: {
+          invoicePayments: {
+            include: {
+              invoice: true
+            }
+          },
+          customer: true,
+          bankAccount: true,
+          journalEntry: {
+            include: {
+              lines: {
+                include: {
+                  account: true
+                }
+              }
+            }
+          }
+        }
+      });
+
+      // ─── Update Each Invoice ─────────────────────────────
+      const orderIdsToSync = new Set();
+      for (const inv of validatedInvoices) {
+        const invoice = inv.invoice;
+        const newPaidAmount = inv.totalPaid + inv.amountPaid;
+        const newOutstanding = invoice.grandTotal - newPaidAmount;
+
+        let invoiceStatus = invoice.invoiceStatus;
+        if (newOutstanding <= 0) {
+          invoiceStatus = 'Paid';
+        } else if (newPaidAmount > 0) {
+          invoiceStatus = 'Partially Paid';
+        }
+
+        await tx.salesInvoice.update({
+          where: { id: invoice.id },
+          data: {
+            paidAmount: newPaidAmount,
+            outstanding: Math.max(0, newOutstanding),
+            invoiceStatus: invoiceStatus,
+            paymentStatus: newOutstanding <= 0 ? 'Paid' : 'Partial'
+          }
+        });
+
+        await tx.accountsReceivable.updateMany({
+          where: { invoiceId: invoice.id },
+          data: {
+            paidAmount: newPaidAmount,
+            outstanding: Math.max(0, newOutstanding),
+            status: newOutstanding <= 0 ? 'Paid' : 'Current'
+          }
+        });
+
+        // Keep installment schedule in sync with existing payment collections (no duplicate payments)
+        if (invoice.isInstallmentSale) {
+          try {
+            const {
+              applyPaymentToSalesInstallments,
+            } = require('../../services/installmentScheduleService');
+            await applyPaymentToSalesInstallments({
+              companyId,
+              invoiceId: invoice.id,
+              amount: inv.amountPaid,
+              salesPaymentId: payment.id,
+              preferredInstallmentIds:
+                inv.preferredInstallmentIds || inv.installmentIds || null,
+              tx,
+            });
+          } catch (instErr) {
+            console.warn('[receivePayment] installment schedule update skipped:', instErr.message);
+          }
+        }
+
+        if (invoice.orderId) {
+          orderIdsToSync.add(invoice.orderId);
+        }
+      }
+
+      const Order = require('./Order');
+      for (const orderId of orderIdsToSync) {
+        await Order.syncFromInvoices(orderId, tx);
+      }
+
+      const totalOutstanding = await tx.salesInvoice.aggregate({
+        where: {
+          customerId: customerId,
+          companyId: companyId,
+          isActive: true,
+          isDeleted: false,
+          invoiceStatus: {
+            notIn: ['Paid', 'Cancelled']
+          }
+        },
+        _sum: {
+          outstanding: true
+        }
+      });
+
+      await tx.customer.update({
+        where: { id: customerId },
+        data: {
+          outstandingBalance: totalOutstanding._sum.outstanding || 0
+        }
+      });
+
+      // ─── Update Bank Account Balance ─────────────────────
+      if (bankAccountId) {
+        await tx.bankAccount.update({
+          where: { id: bankAccountId },
+          data: {
+            currentBalance: {
+              increment: amount
+            }
+          }
+        });
+      }
+
+      return payment;
+    });
+  }
+
+  static invoiceDetailSelect() {
+    return {
+      id: true,
+      invoiceNumber: true,
+      invoiceDate: true,
+      dueDate: true,
+      grandTotal: true,
+      paidAmount: true,
+      outstanding: true,
+      paymentStatus: true,
+      invoiceStatus: true,
+      paymentTerms: true,
+    };
+  }
+
+  static formatPayment(payment) {
+    if (!payment) return null;
+
+    const invoicePayments = (payment.invoicePayments || []).map((ip) => ({
+      id: ip.id,
+      paymentId: ip.paymentId,
+      invoiceId: ip.invoiceId,
+      invoiceNumber: ip.invoiceNumber || ip.invoice?.invoiceNumber || '',
+      amountPaid: Number(ip.amountPaid) || 0,
+      invoice: ip.invoice
+        ? {
+            id: ip.invoice.id,
+            invoiceNumber: ip.invoice.invoiceNumber,
+            invoiceDate: ip.invoice.invoiceDate,
+            dueDate: ip.invoice.dueDate,
+            grandTotal: Number(ip.invoice.grandTotal) || 0,
+            paidAmount: Number(ip.invoice.paidAmount) || 0,
+            outstanding: Number(ip.invoice.outstanding) || 0,
+            paymentStatus: ip.invoice.paymentStatus,
+            invoiceStatus: ip.invoice.invoiceStatus,
+            paymentTerms: ip.invoice.paymentTerms,
+          }
+        : null,
+    }));
+
+    const journalEntry = payment.journalEntry
+      ? {
+          ...payment.journalEntry,
+          lines: (payment.journalEntry.lines || []).map((line) => ({
+            ...line,
+            accountName:
+              line.accountName ||
+              line.account?.accountName ||
+              line.account?.name ||
+              '',
+            accountCode:
+              line.accountCode ||
+              line.account?.accountCode ||
+              line.account?.code ||
+              '',
+          })),
+        }
+      : payment.journalEntry;
+
+    return {
+      ...payment,
+      bankAccountName:
+        payment.bankAccountName ||
+        payment.bankAccount?.accountName ||
+        '',
+      invoicePayments,
+      journalEntry,
+      totalInvoices: invoicePayments.length,
+      canEdit: payment.status !== 'Cancelled',
+      canCancel: payment.status === 'Completed',
+      canDelete: payment.status === 'Cancelled',
+    };
+  }
+
+  // ============================================================
+  // GET PAYMENT BY ID
+  // ============================================================
+  static async findById(id) {
+    const payment = await prisma.salesPaymentReceived.findUnique({
+      where: { id },
+      include: {
+        invoicePayments: {
+          include: {
+            invoice: {
+              select: this.invoiceDetailSelect(),
+            },
+          },
+        },
+        customer: true,
+        bankAccount: true,
+        journalEntry: {
+          include: {
+            lines: {
+              include: {
+                account: true,
+              },
+            },
+          },
+        },
+        creator: {
+          select: { id: true, firstName: true, lastName: true, email: true },
+        },
+      },
+    });
+    return this.formatPayment(payment);
+  }
+
+  // ============================================================
+  // GET PAYMENT BY NUMBER
+  // ============================================================
+  static async findByPaymentNumber(paymentNumber) {
+    return await prisma.salesPaymentReceived.findUnique({
+      where: { paymentNumber },
+      include: {
+        invoicePayments: {
+          include: {
+            invoice: true
+          }
+        },
+        customer: true,
+        bankAccount: true,
+        journalEntry: {
+          include: {
+            lines: {
+              include: {
+                account: true
+              }
+            }
+          }
+        }
+      }
+    });
+  }
+
+  // ============================================================
+  // GET ALL PAYMENTS WITH FILTERS
+  // ============================================================
+  static async findAll(filter = {}, options = {}) {
+    const { skip, take, orderBy = { paymentDate: 'desc' } } = options;
+
+    const payments = await prisma.salesPaymentReceived.findMany({
+      where: {
+        ...filter,
+        isActive: true,
+        isDeleted: false
+      },
+      skip,
+      take,
+      orderBy,
+      include: {
+        invoicePayments: {
+          include: {
+            invoice: {
+              select: this.invoiceDetailSelect(),
+            }
+          }
+        },
+        customer: true,
+        bankAccount: true,
+        creator: {
+          select: { id: true, firstName: true, lastName: true, email: true }
+        }
+      }
+    });
+
+    return payments.map((p) => this.formatPayment(p));
+  }
+
+  // ============================================================
+  // COUNT PAYMENTS
+  // ============================================================
+  static async count(filter = {}) {
+    return await prisma.salesPaymentReceived.count({
+      where: {
+        ...filter,
+        isActive: true,
+        isDeleted: false
+      }
+    });
+  }
+
+  // ============================================================
+  // GET PAYMENT STATS
+  // ============================================================
+  static async getStats(companyId) {
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const startOfMonth = new Date(today.getFullYear(), today.getMonth(), 1);
+
+    const baseFilter = {
+      isActive: true,
+      isDeleted: false,
+      companyId: companyId
+    };
+
+    const [todayPayments, todayAmount, monthPayments, monthAmount, totalPayments, totalAmount] = await Promise.all([
+      prisma.salesPaymentReceived.count({
+        where: {
+          ...baseFilter,
+          paymentDate: { gte: today }
+        }
+      }),
+      prisma.salesPaymentReceived.aggregate({
+        where: {
+          ...baseFilter,
+          paymentDate: { gte: today }
+        },
+        _sum: { amount: true }
+      }),
+      prisma.salesPaymentReceived.count({
+        where: {
+          ...baseFilter,
+          paymentDate: { gte: startOfMonth }
+        }
+      }),
+      prisma.salesPaymentReceived.aggregate({
+        where: {
+          ...baseFilter,
+          paymentDate: { gte: startOfMonth }
+        },
+        _sum: { amount: true }
+      }),
+      prisma.salesPaymentReceived.count({
+        where: baseFilter
+      }),
+      prisma.salesPaymentReceived.aggregate({
+        where: baseFilter,
+        _sum: { amount: true }
+      })
+    ]);
+
+    return {
+      today: {
+        count: todayPayments || 0,
+        amount: todayAmount._sum.amount || 0
+      },
+      month: {
+        count: monthPayments || 0,
+        amount: monthAmount._sum.amount || 0
+      },
+      total: {
+        count: totalPayments || 0,
+        amount: totalAmount._sum.amount || 0
+      }
+    };
+  }
+
+  // ============================================================
+  // CANCEL PAYMENT
+  // ============================================================
+  static async updateMetadata(id, data) {
+    const payment = await prisma.salesPaymentReceived.findUnique({ where: { id } });
+    if (!payment) throw new Error('Payment not found');
+    if (payment.status === 'Cancelled') {
+      throw new Error('Cannot edit cancelled payment');
+    }
+
+    const updated = await prisma.salesPaymentReceived.update({
+      where: { id },
+      data: {
+        updatedBy: data.updatedBy,
+        ...(data.paymentDate && { paymentDate: new Date(data.paymentDate) }),
+        ...(data.paymentMethod !== undefined && { paymentMethod: data.paymentMethod }),
+        ...(data.reference !== undefined && { reference: data.reference }),
+        ...(data.notes !== undefined && { notes: data.notes }),
+      },
+      include: {
+        invoicePayments: {
+          include: {
+            invoice: {
+              select: this.invoiceDetailSelect(),
+            },
+          },
+        },
+        customer: true,
+        bankAccount: true,
+        journalEntry: {
+          include: {
+            lines: {
+              include: { account: true },
+            },
+          },
+        },
+        creator: {
+          select: { id: true, firstName: true, lastName: true, email: true },
+        },
+      },
+    });
+    return this.formatPayment(updated);
+  }
+
+  static async cancelPayment(id, userId, reason = '') {
+    return await prisma.$transaction(async (tx) => {
+      const payment = await tx.salesPaymentReceived.findUnique({
+        where: { id },
+        include: {
+          invoicePayments: {
+            include: {
+              invoice: {
+                include: {
+                  invoicePayments: {
+                    where: {
+                      payment: {
+                        isActive: true,
+                        isDeleted: false,
+                        status: 'Completed'
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          customer: true,
+          bankAccount: true,
+          journalEntry: {
+            include: {
+              lines: true
+            }
+          }
+        }
+      });
+
+      if (!payment) {
+        throw new Error('Payment not found');
+      }
+
+      if (payment.status === 'Cancelled') {
+        throw new Error('Payment already cancelled');
+      }
+
+      // ─── Reverse Invoice Payments ──────────────────────────
+      const orderIdsToSync = new Set();
+      for (const invPayment of payment.invoicePayments) {
+        const invoice = invPayment.invoice;
+        const totalPaid = invoice.invoicePayments?.reduce((sum, ip) => sum + ip.amountPaid, 0) || 0;
+        const newPaidAmount = totalPaid - invPayment.amountPaid;
+        const newOutstanding = invoice.grandTotal - newPaidAmount;
+
+        let invoiceStatus = invoice.invoiceStatus;
+        if (newPaidAmount <= 0) {
+          invoiceStatus = 'Posted';
+        } else if (newPaidAmount > 0 && newOutstanding > 0) {
+          invoiceStatus = 'Partially Paid';
+        } else if (newOutstanding <= 0) {
+          invoiceStatus = 'Paid';
+        }
+
+        await tx.salesInvoice.update({
+          where: { id: invoice.id },
+          data: {
+            paidAmount: Math.max(0, newPaidAmount),
+            outstanding: Math.max(0, newOutstanding),
+            invoiceStatus: invoiceStatus,
+            paymentStatus: newPaidAmount <= 0 ? 'Unpaid' : (newOutstanding <= 0 ? 'Paid' : 'Partial')
+          }
+        });
+
+        await tx.accountsReceivable.updateMany({
+          where: { invoiceId: invoice.id },
+          data: {
+            paidAmount: Math.max(0, newPaidAmount),
+            outstanding: Math.max(0, newOutstanding),
+            status: newOutstanding <= 0 ? 'Paid' : 'Current'
+          }
+        });
+
+        if (invoice.isInstallmentSale && payment.companyId) {
+          try {
+            const {
+              reversePaymentFromSalesInstallments,
+            } = require('../../services/installmentScheduleService');
+            await reversePaymentFromSalesInstallments({
+              companyId: payment.companyId,
+              invoiceId: invoice.id,
+              amount: invPayment.amountPaid,
+              salesPaymentId: payment.id,
+              tx,
+            });
+          } catch (instErr) {
+            console.warn('[cancelPayment] installment reverse skipped:', instErr.message);
+          }
+        }
+
+        if (invoice.orderId) orderIdsToSync.add(invoice.orderId);
+      }
+
+      const Order = require('./Order');
+      for (const orderId of orderIdsToSync) {
+        await Order.syncFromInvoices(orderId, tx);
+      }
+
+      // ─── Reverse Journal Entry ─────────────────────────────
+      if (payment.journalEntry) {
+        const reverseEntryNumber = `REV-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
+
+        const reverseEntry = await tx.journalEntry.create({
+          data: {
+            entryNumber: reverseEntryNumber,
+            date: new Date(),
+            description: `Reversal of payment #${payment.paymentNumber}`,
+            reference: payment.paymentNumber,
+            status: 'Posted',
+            createdBy: userId,
+            postedBy: userId,
+            postedAt: new Date(),
+            companyId: payment.companyId,
+            fiscalYearId: payment.fiscalYearId,
+            lines: {
+              create: payment.journalEntry.lines.map(line => ({
+                accountId: line.accountId,
+                accountName: line.accountName,
+                accountCode: line.accountCode,
+                debit: line.credit,
+                credit: line.debit
+              }))
+            }
+          },
+          include: { lines: true }
+        });
+
+        await BalanceCalculator.applyJournalLines(tx, reverseEntry.lines);
+      }
+
+      // ─── Update Bank Account Balance ──────────────────────
+      if (payment.bankAccountId) {
+        await tx.bankAccount.update({
+          where: { id: payment.bankAccountId },
+          data: {
+            currentBalance: {
+              decrement: payment.amount
+            }
+          }
+        });
+      }
+
+      // ─── Update Customer Outstanding Balance ──────────────
+      const totalOutstanding = await tx.salesInvoice.aggregate({
+        where: {
+          customerId: payment.customerId,
+          companyId: payment.companyId,
+          isActive: true,
+          isDeleted: false,
+          invoiceStatus: {
+            notIn: ['Paid', 'Cancelled']
+          }
+        },
+        _sum: {
+          outstanding: true
+        }
+      });
+
+      await tx.customer.update({
+        where: { id: payment.customerId },
+        data: {
+          outstandingBalance: totalOutstanding._sum.outstanding || 0
+        }
+      });
+
+      // ─── Update Payment Status ─────────────────────────────
+      const cancelledPayment = await tx.salesPaymentReceived.update({
+        where: { id },
+        data: {
+          status: 'Cancelled',
+          updatedBy: userId,
+          notes: payment.notes ? `${payment.notes}\nCancelled: ${reason || 'No reason'}` : `Cancelled: ${reason || 'No reason'}`
+        },
+        include: {
+          invoicePayments: {
+            include: {
+              invoice: true
+            }
+          },
+          customer: true,
+          bankAccount: true
+        }
+      });
+
+      return cancelledPayment;
+    });
+  }
+}
+
+module.exports = SalesPaymentReceivedModel;

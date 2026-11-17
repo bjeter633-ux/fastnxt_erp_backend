@@ -1,0 +1,795 @@
+// warehouse/controller/deliveryController.js - COMPLETE DELIVERY CONTROLLER
+
+const Delivery = require('../models/Delivery');
+const prisma = require('../../prisma/client');
+
+// ============================================================
+// ─── DELIVERY CONTROLLERS ────────────────────────────────────
+// ============================================================
+
+// @desc    Create Delivery against Sales Order
+// @route   POST /api/deliveries
+// @access  Private
+const createDelivery = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const companyId = (req.method === 'GET' || req.method === 'HEAD') ? (req.companyIdFilter ?? req.user.companyId) : req.user.companyId;
+    const {
+      salesOrderId,
+      salesOrderIds,
+      deliveryDate,
+      deliveryPerson,
+      trackingNumber,
+      notes,
+      items,
+      locationId,
+    } = req.body;
+
+    const orderIds = Array.isArray(salesOrderIds) && salesOrderIds.length > 0
+      ? salesOrderIds
+      : (salesOrderId ? [salesOrderId] : []);
+
+    // ─── Validation ──────────────────────────────────────
+    if (orderIds.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'Sales order ID is required'
+      });
+    }
+
+    if (!deliveryDate) {
+      return res.status(400).json({
+        success: false,
+        message: 'Delivery date is required'
+      });
+    }
+
+    if (!items || items.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'Delivery must have at least one item'
+      });
+    }
+
+    let delivery;
+    if (orderIds.length > 1) {
+      delivery = await Delivery.createMultiOrder({
+        salesOrderIds: orderIds,
+        deliveryDate,
+        deliveryPerson,
+        trackingNumber,
+        notes,
+        items,
+        createdBy: userId,
+        companyId,
+        locationId,
+      });
+    } else {
+      const singleOrderId = orderIds[0];
+      // ─── Check if sales order exists ─────────────────────
+      const salesOrder = await prisma.order.findFirst({
+        where: {
+          id: singleOrderId,
+          companyId: companyId,
+          isActive: true,
+          orderType: 'Sales Order'
+        },
+        include: {
+          items: true
+        }
+      });
+
+      if (!salesOrder) {
+        return res.status(404).json({
+          success: false,
+          message: 'Sales order not found'
+        });
+      }
+
+      // ─── Check if order is already fully delivered ──────
+      if (salesOrder.orderStatus === 'Delivered' || salesOrder.orderStatus === 'Cancelled') {
+        return res.status(400).json({
+          success: false,
+          message: `Cannot create delivery for ${salesOrder.orderStatus} order`
+        });
+      }
+
+      // ─── Create Delivery ──────────────────────────────────
+      const deliveryData = {
+        salesOrderId: singleOrderId,
+        deliveryDate,
+        deliveryPerson,
+        trackingNumber,
+        notes,
+        items,
+        createdBy: userId,
+        companyId: companyId,
+        locationId: locationId || salesOrder.locationId || undefined,
+      };
+
+      delivery = await Delivery.create(deliveryData);
+    }
+
+    res.status(201).json({
+      success: true,
+      message: 'Delivery created successfully',
+      data: delivery
+    });
+  } catch (error) {
+    console.error('Create delivery error:', error);
+    res.status(500).json({
+      success: false,
+      message: error.message || 'Server error',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+};
+
+// @desc    Confirm Delivery (Reduce Stock)
+// @route   POST /api/deliveries/:id/confirm
+// @access  Private
+const confirmDelivery = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const companyId = (req.method === 'GET' || req.method === 'HEAD') ? (req.companyIdFilter ?? req.user.companyId) : req.user.companyId;
+    const { id } = req.params;
+
+    // ─── Check if delivery exists ────────────────────────
+    const delivery = await prisma.delivery.findFirst({
+      where: {
+        id: id,
+        companyId: companyId,
+        isActive: true,
+        isDeleted: false
+      }
+    });
+
+    if (!delivery) {
+      return res.status(404).json({
+        success: false,
+        message: 'Delivery not found'
+      });
+    }
+
+    if (delivery.deliveryStatus === 'Delivered') {
+      return res.status(400).json({
+        success: false,
+        message: 'Delivery is already confirmed'
+      });
+    }
+
+    if (delivery.confirmedAt) {
+      return res.status(400).json({
+        success: false,
+        message: 'Delivery has already been confirmed'
+      });
+    }
+
+    // ─── Confirm Delivery ────────────────────────────────
+    const confirmedDelivery = await Delivery.confirmDelivery(id, userId);
+
+    res.status(200).json({
+      success: true,
+      message: 'Delivery confirmed successfully',
+      data: confirmedDelivery
+    });
+  } catch (error) {
+    console.error('Confirm delivery error:', error);
+    res.status(500).json({
+      success: false,
+      message: error.message || 'Server error',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+};
+
+// @desc    Get Delivery by ID
+// @route   GET /api/deliveries/:id
+// @access  Private
+const getDeliveryById = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const companyId = (req.method === 'GET' || req.method === 'HEAD') ? (req.companyIdFilter ?? req.user.companyId) : req.user.companyId;
+    const { id } = req.params;
+
+    const delivery = await prisma.delivery.findFirst({
+      where: {
+        id: id,
+        companyId: companyId,
+        isActive: true,
+        isDeleted: false
+      },
+      include: {
+        items: {
+          include: {
+            product: {
+              select: { id: true, name: true, sku: true }
+            }
+          }
+        },
+        salesOrder: {
+          include: {
+            customer: true,
+            items: true
+          }
+        },
+        customer: true,
+        creator: {
+          select: { id: true, firstName: true, lastName: true, email: true }
+        },
+        confirmer: {
+          select: { id: true, firstName: true, lastName: true, email: true }
+        },
+        updater: {
+          select: { id: true, firstName: true, lastName: true, email: true }
+        },
+        salesInvoices: {
+          where: {
+            isActive: true,
+            isDeleted: false
+          },
+          select: {
+            id: true,
+            invoiceNumber: true,
+            paymentStatus: true,
+            paidAmount: true,
+            outstanding: true,
+            grandTotal: true
+          }
+        }
+      }
+    });
+
+    if (!delivery) {
+      return res.status(404).json({
+        success: false,
+        message: 'Delivery not found'
+      });
+    }
+
+    res.status(200).json({
+      success: true,
+      data: delivery
+    });
+  } catch (error) {
+    console.error('Get delivery error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Server error',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+};
+
+// @desc    Get Delivery by Delivery Number
+// @route   GET /api/deliveries/number/:deliveryNumber
+// @access  Private
+const getDeliveryByNumber = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const companyId = (req.method === 'GET' || req.method === 'HEAD') ? (req.companyIdFilter ?? req.user.companyId) : req.user.companyId;
+    const { deliveryNumber } = req.params;
+
+    const delivery = await prisma.delivery.findFirst({
+      where: {
+        deliveryNumber: deliveryNumber,
+        companyId: companyId,
+        isActive: true,
+        isDeleted: false
+      },
+      include: {
+        items: {
+          include: {
+            product: {
+              select: { id: true, name: true, sku: true }
+            }
+          }
+        },
+        salesOrder: {
+          include: {
+            customer: true
+          }
+        },
+        creator: {
+          select: { id: true, firstName: true, lastName: true, email: true }
+        },
+        confirmer: {
+          select: { id: true, firstName: true, lastName: true, email: true }
+        }
+      }
+    });
+
+    if (!delivery) {
+      return res.status(404).json({
+        success: false,
+        message: 'Delivery not found'
+      });
+    }
+
+    res.status(200).json({
+      success: true,
+      data: delivery
+    });
+  } catch (error) {
+    console.error('Get delivery by number error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Server error',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+};
+
+// @desc    Get Deliveries by Sales Order
+// @route   GET /api/deliveries/order/:orderId
+// @access  Private
+const getDeliveriesByOrder = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const companyId = (req.method === 'GET' || req.method === 'HEAD') ? (req.companyIdFilter ?? req.user.companyId) : req.user.companyId;
+    const { orderId } = req.params;
+
+    // ─── Check if order exists ──────────────────────────
+    const order = await prisma.order.findFirst({
+      where: {
+        id: orderId,
+        companyId: companyId,
+        isActive: true
+      }
+    });
+
+    if (!order) {
+      return res.status(404).json({
+        success: false,
+        message: 'Order not found'
+      });
+    }
+
+    const deliveries = await Delivery.findBySalesOrder(orderId);
+
+    res.status(200).json({
+      success: true,
+      count: deliveries.length,
+      data: deliveries
+    });
+  } catch (error) {
+    console.error('Get deliveries by order error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Server error',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+};
+
+// @desc    Get All Deliveries with Filters
+// @route   GET /api/deliveries
+// @access  Private
+const getDeliveries = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const companyId = (req.method === 'GET' || req.method === 'HEAD') ? (req.companyIdFilter ?? req.user.companyId) : req.user.companyId;
+    const {
+      page = 1,
+      limit = 20,
+      search,
+      status,
+      customerId,
+      fromDate,
+      toDate,
+      sortBy = 'deliveryDate',
+      sortOrder = 'desc',
+      locationId,
+    } = req.query;
+
+    const filter = {
+      companyId: companyId,
+      isActive: true,
+      isDeleted: false
+    };
+
+    if (locationId) {
+      filter.locationId = locationId;
+    }
+
+    if (search) {
+      filter.OR = [
+        { deliveryNumber: { contains: search, mode: 'insensitive' } },
+        { customerName: { contains: search, mode: 'insensitive' } },
+        { salesOrderNumber: { contains: search, mode: 'insensitive' } }
+      ];
+    }
+
+    if (status && status !== 'all') {
+      filter.deliveryStatus = status;
+    }
+
+    if (customerId) {
+      filter.customerId = customerId;
+    }
+
+    if (fromDate || toDate) {
+      filter.deliveryDate = {};
+      if (fromDate) filter.deliveryDate.gte = new Date(fromDate);
+      if (toDate) {
+        const endDate = new Date(toDate);
+        endDate.setHours(23, 59, 59, 999);
+        filter.deliveryDate.lte = endDate;
+      }
+    }
+
+    const pageNum = parseInt(page);
+    const limitNum = parseInt(limit);
+    const skip = (pageNum - 1) * limitNum;
+    const orderBy = { [sortBy]: sortOrder === 'asc' ? 'asc' : 'desc' };
+
+    const [deliveries, total] = await Promise.all([
+      Delivery.findAll(filter, { skip, take: limitNum, orderBy }),
+      Delivery.count(filter)
+    ]);
+
+    // Add payment status to each delivery
+    const deliveriesWithPayment = deliveries.map(delivery => {
+      const salesInvoices = delivery.salesInvoices || [];
+      const totalInvoiceAmount = salesInvoices.reduce((sum, inv) => sum + (inv.grandTotal || 0), 0);
+      const totalPaid = salesInvoices.reduce((sum, inv) => sum + (inv.paidAmount || 0), 0);
+      const totalOutstanding = salesInvoices.reduce((sum, inv) => sum + (inv.outstanding || 0), 0);
+
+      let paymentStatus = 'Unpaid';
+      if (totalInvoiceAmount > 0) {
+        if (totalPaid >= totalInvoiceAmount) {
+          paymentStatus = 'Paid';
+        } else if (totalPaid > 0) {
+          paymentStatus = 'Partially Paid';
+        }
+      }
+
+      return {
+        ...delivery,
+        paymentStatus,
+        paidAmount: totalPaid,
+        outstandingAmount: totalOutstanding
+      };
+    });
+
+    const kpi = await Delivery.getStatusCounts(companyId, locationId || null);
+
+    res.status(200).json({
+      success: true,
+      count: deliveriesWithPayment.length,
+      data: deliveriesWithPayment,
+      kpi,
+      pagination: {
+        page: pageNum,
+        limit: limitNum,
+        total,
+        pages: Math.ceil(total / limitNum),
+        hasNext: pageNum < Math.ceil(total / limitNum),
+        hasPrev: pageNum > 1
+      }
+    });
+  } catch (error) {
+    console.error('Get deliveries error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Server error',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+};
+
+// @desc    Update Delivery
+// @route   PUT /api/deliveries/:id
+// @access  Private
+const updateDelivery = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const companyId = (req.method === 'GET' || req.method === 'HEAD') ? (req.companyIdFilter ?? req.user.companyId) : req.user.companyId;
+    const { id } = req.params;
+    const {
+      deliveryDate,
+      deliveryPerson,
+      trackingNumber,
+      notes,
+      items
+    } = req.body;
+
+    // ─── Check if delivery exists ────────────────────────
+    const delivery = await prisma.delivery.findFirst({
+      where: {
+        id: id,
+        companyId: companyId,
+        isActive: true,
+        isDeleted: false
+      }
+    });
+
+    if (!delivery) {
+      return res.status(404).json({
+        success: false,
+        message: 'Delivery not found'
+      });
+    }
+
+    if (delivery.confirmedAt) {
+      return res.status(400).json({
+        success: false,
+        message: 'Cannot update confirmed delivery'
+      });
+    }
+
+    // ─── Prepare update data ─────────────────────────────
+    const updateData = {
+      updatedBy: userId
+    };
+
+    if (deliveryDate) updateData.deliveryDate = deliveryDate;
+    if (deliveryPerson !== undefined) updateData.deliveryPerson = deliveryPerson;
+    if (trackingNumber !== undefined) updateData.trackingNumber = trackingNumber;
+    if (notes !== undefined) updateData.notes = notes;
+    if (items) updateData.items = items;
+
+    // ─── Update Delivery ──────────────────────────────────
+    const updatedDelivery = await Delivery.update(id, updateData);
+
+    res.status(200).json({
+      success: true,
+      message: 'Delivery updated successfully',
+      data: updatedDelivery
+    });
+  } catch (error) {
+    console.error('Update delivery error:', error);
+    res.status(500).json({
+      success: false,
+      message: error.message || 'Server error',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+};
+
+// @desc    Delete Delivery (Soft Delete)
+// @route   DELETE /api/deliveries/:id
+// @access  Private
+const deleteDelivery = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const companyId = (req.method === 'GET' || req.method === 'HEAD') ? (req.companyIdFilter ?? req.user.companyId) : req.user.companyId;
+    const { id } = req.params;
+
+    // ─── Check if delivery exists ────────────────────────
+    const delivery = await prisma.delivery.findFirst({
+      where: {
+        id: id,
+        companyId: companyId,
+        isActive: true,
+        isDeleted: false
+      }
+    });
+
+    if (!delivery) {
+      return res.status(404).json({
+        success: false,
+        message: 'Delivery not found'
+      });
+    }
+
+    if (delivery.confirmedAt) {
+      return res.status(400).json({
+        success: false,
+        message: 'Cannot delete confirmed delivery'
+      });
+    }
+
+    // ─── Soft Delete Delivery ────────────────────────────
+    await Delivery.softDelete(id, userId);
+
+    res.status(200).json({
+      success: true,
+      message: 'Delivery deleted successfully'
+    });
+  } catch (error) {
+    console.error('Delete delivery error:', error);
+    res.status(500).json({
+      success: false,
+      message: error.message || 'Server error',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+};
+
+// @desc    Get Delivery Statistics
+// @route   GET /api/deliveries/stats
+// @access  Private
+const getDeliveryStats = async (req, res) => {
+  try {
+    const companyId = (req.method === 'GET' || req.method === 'HEAD') ? (req.companyIdFilter ?? req.user.companyId) : req.user.companyId;
+    const { locationId } = req.query;
+    const stats = await Delivery.getStats(companyId, locationId || null);
+    
+    res.status(200).json({
+      success: true,
+      data: stats
+    });
+  } catch (error) {
+    console.error('Get delivery stats error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Server error',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+};
+
+// @desc    Get Delivery KPI
+// @route   GET /api/deliveries/kpi
+// @access  Private
+const getDeliveryKPI = async (req, res) => {
+  try {
+    const companyId = (req.method === 'GET' || req.method === 'HEAD') ? (req.companyIdFilter ?? req.user.companyId) : req.user.companyId;
+    const { locationId } = req.query;
+    const kpi = await Delivery.getStatusCounts(companyId, locationId || null);
+    
+    res.status(200).json({
+      success: true,
+      data: kpi
+    });
+  } catch (error) {
+    console.error('Get delivery KPI error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Server error',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+};
+
+// @desc    Get Product Delivery Summary
+// @route   GET /api/deliveries/product-summary
+// @access  Private
+const getProductDeliverySummary = async (req, res) => {
+  try {
+    const companyId = (req.method === 'GET' || req.method === 'HEAD') ? (req.companyIdFilter ?? req.user.companyId) : req.user.companyId;
+    const { startDate, endDate, locationId } = req.query;
+
+    const summary = await Delivery.getProductDeliverySummary(
+      companyId,
+      startDate,
+      endDate,
+      locationId || null
+    );
+    
+    res.status(200).json({
+      success: true,
+      data: summary
+    });
+  } catch (error) {
+    console.error('Get product delivery summary error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Server error',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+};
+
+// @desc    Get Available Sales Orders for Delivery
+// @route   GET /api/deliveries/available-orders
+// @access  Private
+const getAvailableOrdersForDelivery = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const companyId = (req.method === 'GET' || req.method === 'HEAD') ? (req.companyIdFilter ?? req.user.companyId) : req.user.companyId;
+    const { search, page = 1, limit = 20, locationId } = req.query;
+
+    const locId = String(locationId || '').trim();
+
+    const and = [
+      ...(companyId ? [{ OR: [{ companyId: companyId }, { companyId: null }] }] : []),
+      { isActive: true },
+      { isDeleted: false },
+      { orderType: { notIn: ['Purchase Order', 'Purchase'] } },
+      { orderStatus: { notIn: ['Delivered', 'Cancelled', 'Completed', 'Returned'] } },
+    ];
+
+    if (locId) {
+      and.push({ locationId: locId });
+    }
+
+    if (search && String(search).trim()) {
+      const q = String(search).trim();
+      and.push({
+        OR: [
+          { orderNumber: { contains: q, mode: 'insensitive' } },
+          { customerName: { contains: q, mode: 'insensitive' } },
+        ],
+      });
+    }
+
+    const where = { AND: and };
+
+    const {
+      getReservedDeliveredQtyByProduct,
+      buildRemainingDeliveryLines,
+    } = require('../services/salesQuantityService');
+
+    const orders = await prisma.order.findMany({
+      where,
+      include: {
+        items: true,
+      },
+      skip: (parseInt(page) - 1) * parseInt(limit),
+      take: parseInt(limit),
+      orderBy: {
+        orderDate: 'desc'
+      }
+    });
+
+    // Multi-order-aware remaining (includes secondary SO lines on shared deliveries)
+    const ordersWithRemaining = [];
+    for (const order of orders) {
+      const reservedQty = await getReservedDeliveredQtyByProduct(order.id);
+      const remainingItems = buildRemainingDeliveryLines(order.items, reservedQty).map((item) => ({
+        id: item.id,
+        productId: item.productId,
+        productName: item.productName,
+        sku: item.sku,
+        orderedQuantity: item.orderedQuantity,
+        deliveredQuantity: item.deliveredQuantity,
+        remainingQuantity: item.remainingQuantity,
+        unitPrice: Number(item.unitPrice) || 0,
+        unit: item.unit || 'Pcs',
+      }));
+
+      if (remainingItems.length === 0) continue;
+
+      ordersWithRemaining.push({
+        id: order.id,
+        orderNumber: order.orderNumber,
+        customerName: order.customerName,
+        customerEmail: order.customerEmail || '',
+        customerPhone: order.customerPhone || '',
+        orderDate: order.orderDate,
+        orderStatus: order.orderStatus,
+        locationId: order.locationId,
+        items: remainingItems,
+        remainingItems,
+        hasRemainingItems: true,
+      });
+    }
+
+    const total = ordersWithRemaining.length;
+
+    res.status(200).json({
+      success: true,
+      count: ordersWithRemaining.length,
+      data: ordersWithRemaining,
+      pagination: {
+        page: parseInt(page),
+        limit: parseInt(limit),
+        total,
+        pages: Math.ceil(total / parseInt(limit)) || 1
+      }
+    });
+  } catch (error) {
+    console.error('Get available orders for delivery error:', error);
+    res.status(500).json({
+      success: false,
+      message: error.message || 'Server error'
+    });
+  }
+};
+
+module.exports = {
+  createDelivery,
+  confirmDelivery,
+  getDeliveryById,
+  getDeliveryByNumber,
+  getDeliveriesByOrder,
+  getDeliveries,
+  updateDelivery,
+  deleteDelivery,
+  getDeliveryStats,
+  getDeliveryKPI,
+  getProductDeliverySummary,
+  getAvailableOrdersForDelivery
+};

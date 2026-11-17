@@ -1,0 +1,1452 @@
+
+const ExpenseModel = require('../models/Expense');
+const prisma = require('../prisma/client');
+const { fiscalYearGuard } = require('../middleware/fiscalYearMiddleware');
+const { resolveFiscalYearId } = require('../utils/fiscalYearHelper');
+const { getOrCreateCashAccount } = require('../utils/cashAccountHelper');
+const { pickRequestedLocationId } = require('../utils/locationAccessHelper');
+const { withLocation } = require('../utils/accountingLocationHelper');
+const { resolveLocationId } = require('../warehouse/services/locationService');
+const EXPENSE_ACCOUNT_MAPPING = {
+  'Rent': { code: '5100', name: 'Rent Expense' },
+  'Utilities': { code: '5200', name: 'Utilities Expense' },
+  'Salaries': { code: '5300', name: 'Salaries Expense' },
+  'Marketing': { code: '5400', name: 'Marketing Expense' },
+  'Office Supplies': { code: '5500', name: 'Office Supplies Expense' },
+  'Travel': { code: '5600', name: 'Travel Expense' },
+  'Meals': { code: '5700', name: 'Meals & Entertainment' },
+  'Insurance': { code: '5800', name: 'Insurance Expense' },
+  'Maintenance': { code: '5900', name: 'Maintenance Expense' },
+  'Software': { code: '6000', name: 'Software Expense' },
+  'Taxes': { code: '6100', name: 'Taxes Expense' },
+  'Miscellaneous': { code: '6900', name: 'Other Expenses' },
+  'Other': { code: '6900', name: 'Other Expenses' }
+};
+
+const DEFAULT_EXPENSE_ACCOUNT = { code: '6900', name: 'Other Expenses' };
+
+function mapPurchasePaymentMethod(method) {
+  const m = String(method || 'Cash');
+  if (m === 'Online Payment') return 'Online';
+  if (['Cash', 'Bank Transfer', 'Cheque', 'Credit Card', 'Online'].includes(m)) return m;
+  return 'Cash';
+}
+
+const createExpenseFromPurchasePayment = async ({
+  userId,
+  companyId,
+  payment,
+  fiscalYearId = null
+}) => {
+  if (!payment || !userId || !companyId) {
+    throw new Error('Missing data for purchase expense creation');
+  }
+
+  const paymentNumber = payment.paymentNumber;
+  const reference = `PP:${paymentNumber}`;
+
+  // Idempotent — one expense per purchase payment
+  const existing = await prisma.expense.findFirst({
+    where: {
+      companyId,
+      reference,
+      status: { not: 'Cancelled' }
+    }
+  });
+  if (existing) {
+    console.log(`ℹ️ Expense already exists for ${reference}: ${existing.expenseNumber}`);
+    return existing;
+  }
+
+  let expenseAccount = await getExistingExpenseAccount(userId, companyId, 'Other');
+  if (!expenseAccount) {
+    expenseAccount = await prisma.chartOfAccount.findFirst({
+      where: {
+        companyId,
+        type: 'Expense',
+        isActive: true
+      },
+      orderBy: { code: 'asc' }
+    });
+  }
+  if (!expenseAccount) {
+    throw new Error('No expense account found. Please create an Expense account in Chart of Accounts.');
+  }
+
+  const invoiceLines = (payment.invoicePayments || [])
+    .map((ip) => ip.invoiceNumber)
+    .filter(Boolean);
+  const invoiceLabel = invoiceLines.length
+    ? invoiceLines.join(', ')
+    : 'purchase invoice(s)';
+
+  const amount = Number(payment.amount) || 0;
+  if (amount <= 0) {
+    throw new Error('Purchase payment amount must be greater than 0');
+  }
+
+  const paymentDate = payment.paymentDate
+    ? new Date(payment.paymentDate)
+    : new Date();
+
+  const fyId =
+    fiscalYearId ||
+    (await resolveFiscalYearId(userId, paymentDate).catch(() => null));
+
+  let paymentLocationId = null;
+  const firstInvoicePayment = (payment.invoicePayments || [])[0];
+  if (firstInvoicePayment?.invoice?.locationId) {
+    paymentLocationId = firstInvoicePayment.invoice.locationId;
+  } else if (firstInvoicePayment?.invoice?.purchaseOrder?.locationId) {
+    paymentLocationId = firstInvoicePayment.invoice.purchaseOrder.locationId;
+  } else if (firstInvoicePayment?.invoice?.goodsReceiving?.locationId) {
+    paymentLocationId = firstInvoicePayment.invoice.goodsReceiving.locationId;
+  }
+  const resolvedLocationId = await resolveLocationId(
+    prisma,
+    companyId,
+    paymentLocationId,
+    userId
+  );
+
+  const expense = await ExpenseModel.create({
+    date: paymentDate,
+    expenseType: 'Other',
+    expenseAccountId: expenseAccount.id,
+    vendorId: payment.supplierId || null,
+    vendorName: payment.supplierName || '',
+    amount,
+    taxRate: 0,
+    description: `Purchase payment ${paymentNumber} for ${invoiceLabel}`,
+    reference,
+    paymentMethod: mapPurchasePaymentMethod(payment.paymentMethod),
+    bankAccountId: payment.bankAccountId || null,
+    fiscalYearId: fyId,
+    status: 'Posted',
+    postedBy: userId,
+    postedAt: new Date(),
+    createdBy: userId,
+    companyId,
+    locationId: resolvedLocationId
+  });
+
+console.log(
+    `✅ Expense ${expense.expenseNumber} created from purchase payment ${paymentNumber}`
+  );
+  return expense;
+};
+
+// ─── HELPER: Get existing expense account (DO NOT CREATE NEW) ───
+async function getExistingExpenseAccount(userId, companyId, expenseType) {
+  const mapping = EXPENSE_ACCOUNT_MAPPING[expenseType] || DEFAULT_EXPENSE_ACCOUNT;
+  
+  let expenseAccount = await prisma.chartOfAccount.findFirst({
+    where: {
+      code: mapping.code,
+      
+      companyId: companyId,
+      type: 'Expense'
+    }
+  });
+
+  if (!expenseAccount) {
+    expenseAccount = await prisma.chartOfAccount.findFirst({
+      where: {
+        name: mapping.name,
+        
+        companyId: companyId,
+        type: 'Expense'
+      }
+    });
+  }
+
+  return expenseAccount;
+}
+
+// ─── HELPER: Get all expense accounts for dropdown ──────────────
+async function getExpenseAccountsForDropdown(userId, companyId) {
+  return await prisma.chartOfAccount.findMany({
+    where: {
+      
+      companyId: companyId,
+      type: 'Expense',
+      isActive: true
+    },
+    select: {
+      id: true,
+      code: true,
+      name: true,
+      type: true
+    },
+    orderBy: {
+      code: 'asc'
+    }
+  });
+}
+
+function expenseAccessWhere(id, userId, companyId) {
+  return {
+    id,
+    OR: [
+      { companyId },
+      { companyId: null, createdBy: userId }
+    ]
+  };
+}
+
+async function reverseExpenseBalances(existing, companyId) {
+  const amount = Number(existing.totalAmount) || 0;
+  if (amount <= 0) return;
+
+  if (existing.expenseAccountId) {
+    await prisma.chartOfAccount.update({
+      where: { id: existing.expenseAccountId },
+      data: { currentBalance: { decrement: amount } }
+    });
+  }
+
+  if (existing.bankAccountId) {
+    const bankAccount = await prisma.bankAccount.findFirst({
+      where: { id: existing.bankAccountId, companyId },
+      include: { chartOfAccount: true }
+    });
+    if (bankAccount) {
+      await prisma.bankAccount.update({
+        where: { id: existing.bankAccountId },
+        data: { currentBalance: { increment: amount } }
+      });
+      if (bankAccount.chartOfAccountId) {
+        await prisma.chartOfAccount.update({
+          where: { id: bankAccount.chartOfAccountId },
+          data: { currentBalance: { increment: amount } }
+        });
+      }
+    }
+  } else {
+    const { findCashAccount } = require('../utils/cashAccountHelper');
+    const cashAccount = await findCashAccount(companyId);
+    if (cashAccount) {
+      await prisma.chartOfAccount.update({
+        where: { id: cashAccount.id },
+        data: { currentBalance: { increment: amount } }
+      });
+    }
+  }
+}
+
+async function applyExpenseBalances({
+  expenseAccount,
+  cashOrBankAccount,
+  bankAccountId,
+  bankAccountData,
+  totalAmount
+}) {
+  const amount = Number(totalAmount) || 0;
+  if (amount <= 0) return;
+
+  if (bankAccountId && bankAccountData) {
+    await prisma.bankAccount.update({
+      where: { id: bankAccountId },
+      data: { currentBalance: { decrement: amount } }
+    });
+    if (bankAccountData.chartOfAccountId) {
+      await prisma.chartOfAccount.update({
+        where: { id: bankAccountData.chartOfAccountId },
+        data: { currentBalance: { decrement: amount } }
+      });
+    }
+  } else if (cashOrBankAccount) {
+    await prisma.chartOfAccount.update({
+      where: { id: cashOrBankAccount.id },
+      data: { currentBalance: { decrement: amount } }
+    });
+  }
+
+  await prisma.chartOfAccount.update({
+    where: { id: expenseAccount.id },
+    data: { currentBalance: { increment: amount } }
+  });
+}
+
+async function reverseExpenseJournals(existing, userId, companyId) {
+  const journals = await prisma.journalEntry.findMany({
+    where: {
+      companyId,
+      status: 'Posted',
+      OR: [
+        { reference: existing.expenseNumber },
+        { description: { contains: existing.expenseNumber } }
+      ]
+    },
+    include: { lines: true }
+  });
+
+  for (const je of journals) {
+    if (/^reversal of/i.test(je.description || '')) continue;
+    await prisma.journalEntry.create({
+      data: {
+        entryNumber: `JE-${Date.now()}-${Math.floor(Math.random() * 999)}`,
+        date: existing.date || new Date(),
+        description: `Reversal of ${je.entryNumber} (${existing.expenseNumber})`,
+        reference: existing.expenseNumber,
+        status: 'Posted',
+        createdBy: userId,
+        postedBy: userId,
+        postedAt: new Date(),
+        companyId,
+        lines: {
+          create: je.lines.map((line) => ({
+            accountId: line.accountId,
+            accountName: line.accountName,
+            accountCode: line.accountCode,
+            debit: line.credit,
+            credit: line.debit,
+            isReconciled: false
+          }))
+        }
+      }
+    });
+  }
+}
+
+async function createExpenseJournalEntry(userId, companyId, expense, expenseAccount, cashOrBankAccount) {
+  const entryNumber = `JE-${Date.now()}`;
+  const costCenterId = expense.costCenterId || null;
+
+  return await prisma.journalEntry.create({
+    data: {
+      entryNumber,
+      date: expense.date || new Date(),
+      description: expense.description || `${expense.expenseType} - ${expense.expenseNumber}`,
+      reference: expense.reference || expense.expenseNumber,
+      status: 'Posted',
+      createdBy: userId,
+      postedBy: userId,
+      postedAt: new Date(),
+      companyId: companyId,
+      locationId: expense.locationId || null,
+      lines: {
+        create: [
+          {
+            accountId: expenseAccount.id,
+            accountName: expenseAccount.name,
+            accountCode: expenseAccount.code,
+            debit: expense.totalAmount,
+            credit: 0,
+            isReconciled: false,
+            ...(costCenterId ? { costCenterId } : {}),
+          },
+          {
+            accountId: cashOrBankAccount.id,
+            accountName: cashOrBankAccount.name,
+            accountCode: cashOrBankAccount.code,
+            debit: 0,
+            credit: expense.totalAmount,
+            isReconciled: false
+          }
+        ]
+      }
+    }
+  });
+}
+
+async function assertCompanyScopedRefs(companyId, { departmentId, costCenterId }) {
+  if (departmentId) {
+    const dept = await prisma.hrDepartment.findFirst({
+      where: { id: departmentId, companyId },
+      select: { id: true },
+    });
+    if (!dept) {
+      const err = new Error('Department not found for this company');
+      err.statusCode = 400;
+      throw err;
+    }
+  }
+  if (costCenterId) {
+    const cc = await prisma.costCenter.findFirst({
+      where: { id: costCenterId, companyId, status: 'active' },
+      select: { id: true },
+    });
+    if (!cc) {
+      const err = new Error('Cost center not found for this company');
+      err.statusCode = 400;
+      throw err;
+    }
+  }
+}
+
+const getExpenseAccounts = async (req, res) => {
+  try {
+    const userId = req.user.id;
+
+    const companyId = (req.method === 'GET' || req.method === 'HEAD') ? (req.companyIdFilter ?? req.user.companyId) : req.user.companyId;
+    const accounts = await getExpenseAccountsForDropdown(userId, companyId);
+
+    res.status(200).json({
+      success: true,
+      data: accounts
+    });
+  } catch (error) {
+    console.error('❌ Get expense accounts error:', error);
+    res.status(500).json({
+      success: false,
+      message: error.message
+    });
+  }
+};
+
+// ============================================================
+// @desc    Create Expense - FIXED with Expense Account dropdown
+// @route   POST /api/expenses
+// @access  Private
+// ============================================================
+const createExpense = async (req, res) => {
+  try {
+    const {
+      date,
+      expenseType,
+      expenseAccountId,
+      vendorId,
+      items,
+      amount,
+      taxRate,
+      description,
+      reference,
+      paymentMethod,
+      bankAccountId,
+      departmentId,
+      costCenterId,
+      receipt,
+      attachments,
+    } = req.body;
+
+    const userId = req.user.id;
+
+    const companyId = (req.method === 'GET' || req.method === 'HEAD') ? (req.companyIdFilter ?? req.user.companyId) : req.user.companyId;
+    const postingDate = date ? new Date(date) : new Date();
+    try {
+      await fiscalYearGuard(userId, postingDate);
+    } catch (err) {
+      if (err.code === 'FISCAL_YEAR_CLOSED') {
+        return res.status(400).json({ success: false, message: err.message });
+      }
+      throw err;
+    }
+
+    console.log("📦 Received expense data:", JSON.stringify(req.body, null, 2));
+
+    try {
+      await assertCompanyScopedRefs(companyId, {
+        departmentId: departmentId || null,
+        costCenterId: costCenterId || null,
+      });
+    } catch (refErr) {
+      return res.status(refErr.statusCode || 400).json({
+        success: false,
+        message: refErr.message,
+      });
+    }
+
+    const resolvedLocationId = await resolveLocationId(
+      prisma,
+      companyId,
+      pickRequestedLocationId(req),
+      userId
+    );
+
+    if (!expenseAccountId) {
+      return res.status(400).json({
+        success: false,
+        message: 'Please select an expense account',
+        suggestion: 'Select an expense account from the dropdown'
+      });
+    }
+
+    const expenseAccount = await prisma.chartOfAccount.findFirst({
+      where: {
+        id: expenseAccountId,
+        companyId: companyId,
+        type: 'Expense',
+        isActive: true
+      }
+    });
+
+    if (!expenseAccount) {
+      return res.status(400).json({
+        success: false,
+        message: 'Selected expense account not found or is not active',
+        suggestion: 'Please select a valid expense account'
+      });
+    }
+
+    console.log(`✅ Using expense account: ${expenseAccount.name} (${expenseAccount.code})`);
+
+    let cleanBankAccountId = null;
+    const rawValue = bankAccountId !== null && bankAccountId !== undefined
+      ? String(bankAccountId).trim()
+      : '';
+
+    if (rawValue &&
+        rawValue !== 'null' &&
+        rawValue !== 'NULL' &&
+        rawValue !== 'undefined' &&
+        rawValue !== '') {
+      cleanBankAccountId = rawValue;
+    }
+
+    console.log(`🔍 bankAccountId from request: ${bankAccountId} (type: ${typeof bankAccountId})`);
+    console.log(`🔍 cleanBankAccountId: "${cleanBankAccountId}"`);
+
+    let vendorName = '';
+    if (vendorId) {
+      const vendor = await prisma.supplier.findFirst({
+        where: {
+          id: vendorId,
+          companyId: companyId}
+      });
+      if (vendor) {
+        vendorName = vendor.name;
+      }
+    }
+
+    let bankAccountData = null;
+    if (cleanBankAccountId) {
+      bankAccountData = await prisma.bankAccount.findFirst({
+        where: {
+          id: cleanBankAccountId,
+          companyId: companyId},
+        include: {
+          chartOfAccount: true
+        }
+      });
+
+      if (!bankAccountData) {
+        return res.status(400).json({
+          success: false,
+          message: 'Bank account not found or does not belong to you'
+        });
+      }
+      
+      console.log(`🏦 Bank Account Found: ${bankAccountData.accountName}`);
+      console.log(`💰 Current Balance: ${bankAccountData.currentBalance}`);
+    }
+
+    let finalItems = [];
+    let finalAmount = 0;
+    let subtotal = 0;
+    let taxAmount = 0;
+    let totalAmount = 0;
+
+    const hasItems = items && items.length > 0;
+
+    if (hasItems) {
+      console.log("📊 Processing DETAILED expense with items");
+      finalItems = items.map(item => ({
+        description: item.description,
+        quantity: item.quantity || 1,
+        unitPrice: item.unitPrice || 0,
+        amount: (item.quantity || 1) * (item.unitPrice || 0)
+      }));
+      subtotal = finalItems.reduce((sum, item) => sum + (item.amount || 0), 0);
+      taxAmount = subtotal * (taxRate || 0) / 100;
+      totalAmount = subtotal + taxAmount;
+      finalAmount = 0;
+    } else {
+      console.log("📊 Processing SIMPLE expense with amount:", amount);
+      finalAmount = amount || 0;
+      subtotal = finalAmount;
+      totalAmount = finalAmount;
+      taxAmount = 0;
+      finalItems = [];
+    }
+
+    console.log(`💰 Total Amount: ${totalAmount}`);
+
+    let formattedDate = date ? new Date(date) : new Date();
+    if (isNaN(formattedDate.getTime())) {
+      formattedDate = new Date();
+    }
+
+    let finalPaymentMethod = paymentMethod || 'Cash';
+    let finalBankAccountId = cleanBankAccountId;
+
+    if (!(totalAmount > 0)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Expense amount must be greater than zero',
+      });
+    }
+
+    const fyId = await resolveFiscalYearId(userId, postingDate);
+    const expense = await ExpenseModel.create({
+      date: formattedDate,
+      expenseType,
+      expenseAccountId: expenseAccount.id,
+      vendorId: vendorId || null,
+      vendorName,
+      items: finalItems,
+      amount: finalAmount,
+      taxRate: taxRate || 0,
+      description: description || '',
+      reference: reference || '',
+      paymentMethod: finalPaymentMethod,
+      bankAccountId: finalBankAccountId,
+      departmentId: departmentId || null,
+      costCenterId: costCenterId || null,
+      receipt: receipt || null,
+      fiscalYearId: fyId,
+      status: 'Posted',
+      postedBy: userId,
+      postedAt: new Date(),
+      createdBy: userId,
+      companyId: companyId,
+      locationId: resolvedLocationId
+    });
+
+    if (Array.isArray(attachments) && attachments.length > 0) {
+      const rows = attachments
+        .filter((a) => a && a.fileUrl)
+        .map((a) => ({
+          expenseId: expense.id,
+          companyId,
+          fileUrl: String(a.fileUrl),
+          fileName: String(a.fileName || ''),
+          fileSize: Number(a.fileSize) || 0,
+          mimeType: String(a.mimeType || ''),
+          cloudinaryPublicId: String(a.cloudinaryPublicId || ''),
+        }));
+      if (rows.length) {
+        await prisma.expenseAttachment.createMany({ data: rows });
+      }
+    }
+
+    console.log("✅ Expense created successfully!");
+    console.log("   ID:", expense.id);
+    console.log("   Number:", expense.expenseNumber);
+    console.log("   Total Amount:", expense.totalAmount);
+
+    let cashOrBankAccount;
+
+    if (finalPaymentMethod === 'Cash' || !finalBankAccountId) {
+      cashOrBankAccount = await getOrCreateCashAccount(userId, companyId);
+      console.log('💵 Using Cash account');
+    } else if (finalBankAccountId && bankAccountData) {
+      cashOrBankAccount = bankAccountData.chartOfAccount;
+      console.log(`🏦 Using Bank account: ${bankAccountData.accountName}`);
+    } else {
+      cashOrBankAccount = await getOrCreateCashAccount(userId, companyId);
+      console.log('💵 Fallback: Using Cash account');
+    }
+
+    if (!cashOrBankAccount) {
+      cashOrBankAccount = await getOrCreateCashAccount(userId, companyId);
+    }
+
+    console.log(`📒 Journal Entry - Debit: ${expenseAccount.name}, Credit: ${cashOrBankAccount.name}`);
+
+    await createExpenseJournalEntry(userId, companyId, expense, expenseAccount, cashOrBankAccount);
+
+    console.log(`🔍 Balance update check - finalBankAccountId: ${finalBankAccountId}, bankAccountData exists: ${!!bankAccountData}`);
+
+    if (finalBankAccountId && bankAccountData) {
+      console.log(`💰 Updating bank account balance: decrementing by ${totalAmount}`);
+      console.log(`🏦 Bank Account ID: ${finalBankAccountId}, ChartOfAccount ID: ${bankAccountData.chartOfAccountId}`);
+
+      await prisma.bankAccount.update({
+        where: { id: finalBankAccountId },
+        data: { currentBalance: { decrement: totalAmount } }
+      });
+
+      if (bankAccountData.chartOfAccountId) {
+        await prisma.chartOfAccount.update({
+          where: { id: bankAccountData.chartOfAccountId },
+          data: { currentBalance: { decrement: totalAmount } }
+        });
+      }
+
+      console.log(`✅ Bank account balance updated successfully!`);
+    } else {
+      console.log(`⚠️ Skipping bank account balance update - finalBankAccountId: ${finalBankAccountId}, bankAccountData: ${bankAccountData ? 'found' : 'not found'}`);
+
+      // Only update cash account if not using bank account
+      if (cashOrBankAccount) {
+        console.log(`💰 Updating cash account balance: decrementing by ${totalAmount}`);
+
+        await prisma.chartOfAccount.update({
+          where: { id: cashOrBankAccount.id },
+          data: { currentBalance: { decrement: totalAmount } }
+        });
+
+        console.log(`✅ Cash account balance updated successfully!`);
+      }
+    }
+
+    console.log(`💰 Updating expense account balance: incrementing by ${totalAmount}`);
+
+    await prisma.chartOfAccount.update({
+      where: { id: expenseAccount.id },
+      data: { currentBalance: { increment: totalAmount } }
+    });
+
+    console.log(`✅ Expense account balance updated successfully!`);
+
+    res.status(201).json({
+      success: true,
+      data: expense,
+      expenseAccount: {
+        id: expenseAccount.id,
+        code: expenseAccount.code,
+        name: expenseAccount.name
+      },
+      message: finalBankAccountId ? 'Expense recorded (Bank Transfer)' : 'Expense recorded (Cash)'
+    });
+
+} catch (error) {
+    console.error("🔥 ERROR in createExpense:", error);
+
+    if (error.code === 'P2002') {
+      return res.status(400).json({
+        success: false,
+        message: 'Duplicate entry. Please try again.'
+      });
+    }
+
+    res.status(500).json({
+      success: false,
+      message: error.message
+    });
+  }
+};
+
+// Helper to merge direct Expense table records with Expense Journal Lines (e.g. COGS, Payroll, Journal Entries)
+async function fetchAllExpensesMerged({ companyId, userId, locationId, startDate, endDate, status, expenseType, search }) {
+  const companyFilter = {
+    OR: [
+      { companyId: companyId },
+      { companyId: null, createdBy: userId }
+    ]
+  };
+
+  const filter = { AND: [companyFilter] };
+  const locFilter = withLocation(locationId);
+  if (Object.keys(locFilter).length) filter.AND.push(locFilter);
+
+  if (expenseType && expenseType !== 'All') {
+    filter.AND.push({ expenseType });
+  }
+
+  if (status && status !== 'All') {
+    filter.AND.push({ status });
+  }
+
+  if (startDate && endDate) {
+    filter.AND.push({
+      date: {
+        gte: new Date(startDate),
+        lte: new Date(endDate)
+      }
+    });
+  }
+
+  if (search) {
+    filter.AND.push({
+      OR: [
+        { expenseNumber: { contains: search, mode: 'insensitive' } },
+        { vendorName:    { contains: search, mode: 'insensitive' } },
+        { description:   { contains: search, mode: 'insensitive' } }
+      ]
+    });
+  }
+
+  const dbExpenses = await prisma.expense.findMany({
+    where: filter,
+    include: {
+      expenseAccount: true,
+      vendor: true,
+      bankAccount: true
+    },
+    orderBy: { date: 'desc' }
+  });
+
+  const existingRefs = new Set();
+  dbExpenses.forEach(e => {
+    if (e.expenseNumber) existingRefs.add(e.expenseNumber);
+    if (e.reference) existingRefs.add(e.reference);
+  });
+
+  // Query Journal Entry Lines for Expense accounts
+  const jeWhere = {
+    journal: {
+      companyId,
+      status: status && status !== 'All' ? (status === 'Draft' ? 'Draft' : { not: 'Cancelled' }) : { not: 'Cancelled' }
+    },
+    account: { type: { in: ['Expense', 'Expenses'] } },
+    debit: { gt: 0 }
+  };
+
+  if (startDate && endDate) {
+    jeWhere.journal.date = {
+      gte: new Date(startDate),
+      lte: new Date(endDate)
+    };
+  }
+
+  const jeLines = await prisma.journalLine.findMany({
+    where: jeWhere,
+    include: {
+      journal: true,
+      account: true
+    }
+  });
+
+  const jeExpenses = jeLines
+    .filter(jl => {
+      const ref = jl.journal.reference;
+      const num = jl.journal.entryNumber;
+      if (ref && existingRefs.has(ref)) return false;
+      if (num && existingRefs.has(num)) return false;
+
+      if (expenseType && expenseType !== 'All') {
+        const typeMatch = (jl.accountName || jl.account?.name || '').toLowerCase().includes(expenseType.toLowerCase());
+        if (!typeMatch) return false;
+      }
+
+      if (search) {
+        const q = search.toLowerCase();
+        const numMatch = (jl.journal.entryNumber || '').toLowerCase().includes(q);
+        const refMatch = (jl.journal.reference || '').toLowerCase().includes(q);
+        const descMatch = (jl.journal.description || '').toLowerCase().includes(q);
+        const accMatch = (jl.accountName || '').toLowerCase().includes(q);
+        if (!numMatch && !refMatch && !descMatch && !accMatch) return false;
+      }
+      return true;
+    })
+    .map(jl => {
+      const amt = Number(jl.debit) || 0;
+      return {
+        id: `je-${jl.id}`,
+        expenseNumber: jl.journal.entryNumber || `JE-${jl.id.slice(0, 8)}`,
+        date: jl.journal.date || jl.journal.createdAt,
+        expenseType: jl.accountName || jl.account?.name || 'General Expense',
+        vendorName: jl.journal.reference || 'General Ledger',
+        items: [
+          {
+            description: jl.journal.description || jl.accountName,
+            quantity: 1,
+            unitPrice: amt,
+            amount: amt
+          }
+        ],
+        amount: amt,
+        hasItems: true,
+        subtotal: amt,
+        taxRate: 0,
+        taxAmount: 0,
+        totalAmount: amt,
+        description: jl.journal.description || `${jl.accountName} - ${jl.journal.entryNumber}`,
+        reference: jl.journal.reference || jl.journal.entryNumber,
+        paymentMethod: 'Journal Entry',
+        status: jl.journal.status === 'Draft' ? 'Draft' : 'Posted',
+        expenseAccount: jl.account ? {
+          id: jl.account.id,
+          code: jl.account.code,
+          name: jl.account.name,
+          type: jl.account.type
+        } : null,
+        isJournalEntry: true,
+        createdAt: jl.journal.createdAt,
+        updatedAt: jl.journal.updatedAt || jl.journal.createdAt
+      };
+    });
+
+  const merged = [...dbExpenses, ...jeExpenses].sort((a, b) => new Date(b.date) - new Date(a.date));
+  return merged;
+}
+
+const getExpenses = async (req, res) => {
+  try {
+    const { 
+      expenseType, 
+      status, 
+      startDate, 
+      endDate, 
+      search,
+      page = 1,
+      limit = 20,
+      locationId
+    } = req.query;
+
+    const userId = req.user.id;
+    const companyId = (req.method === 'GET' || req.method === 'HEAD') ? (req.companyIdFilter ?? req.user.companyId) : req.user.companyId;
+
+    const allMerged = await fetchAllExpensesMerged({
+      companyId,
+      userId,
+      locationId,
+      startDate,
+      endDate,
+      status,
+      expenseType,
+      search
+    });
+
+    const pageNum = parseInt(page) || 1;
+    const limitNum = parseInt(limit) || 20;
+    const skip = (pageNum - 1) * limitNum;
+
+    const paginatedData = allMerged.slice(skip, skip + limitNum);
+    const totalCount = allMerged.length;
+    const totalPages = Math.ceil(totalCount / limitNum);
+
+    const responseData = {
+      count: paginatedData.length,
+      total: totalCount,
+      page: pageNum,
+      pages: totalPages,
+      data: paginatedData
+    };
+
+    res.status(200).json({
+      success: true,
+      ...responseData
+    });
+  } catch (error) {
+    console.error('❌ Get expenses error:', error);
+    res.status(500).json({
+      success: false,
+      message: error.message
+    });
+  }
+};
+
+const getExpense = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const userId = req.user.id;
+
+    const companyId = (req.method === 'GET' || req.method === 'HEAD') ? (req.companyIdFilter ?? req.user.companyId) : req.user.companyId;
+    const expense = await prisma.expense.findFirst({
+      where: {
+        id,
+        creator: {
+          id: userId
+        }
+      },
+      include: {
+        vendor: {
+          select: {
+            id: true,
+            name: true,
+            email: true,
+            phone: true
+          }
+        },
+        bankAccount: {
+          select: {
+            id: true,
+            accountName: true,
+            accountNumber: true,
+            bankName: true
+          }
+        },
+        expenseAccount: {
+          select: {
+            id: true,
+            code: true,
+            name: true,
+            type: true
+          }
+        },
+        department: { select: { id: true, name: true } },
+        costCenter: { select: { id: true, code: true, name: true } },
+        attachments: true,
+        creator: {
+          select: {
+            id: true,
+            firstName: true,
+            lastName: true,
+            email: true
+          }
+        },
+        poster: {
+          select: {
+            id: true,
+            firstName: true,
+            lastName: true,
+            email: true
+          }
+        }
+      }
+    });
+
+    if (!expense) {
+      return res.status(404).json({
+        success: false,
+        message: 'Expense record not found'
+      });
+    }
+
+    res.status(200).json({
+      success: true,
+      data: expense
+    });
+  } catch (error) {
+    console.error('❌ Get expense error:', error);
+    res.status(500).json({
+      success: false,
+      message: error.message
+    });
+  }
+};
+
+const updateExpense = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const userId = req.user.id;
+    const companyId = (req.method === 'GET' || req.method === 'HEAD') ? (req.companyIdFilter ?? req.user.companyId) : req.user.companyId;
+
+    const existing = await prisma.expense.findFirst({
+      where: expenseAccessWhere(id, userId, companyId)
+    });
+
+    if (!existing) {
+      return res.status(404).json({
+        success: false,
+        message: 'Expense record not found'
+      });
+    }
+
+    if (existing.status === 'Cancelled') {
+      return res.status(400).json({
+        success: false,
+        message: 'Cannot update a cancelled expense'
+      });
+    }
+
+    if (existing.status !== 'Draft') {
+      return res.status(400).json({
+        success: false,
+        message: 'Only draft expenses can be edited. Posted expenses cannot be changed.'
+      });
+    }
+
+    const newDate = req.body.date ? new Date(req.body.date) : existing.date;
+    try {
+      await fiscalYearGuard(userId, newDate, existing.date);
+    } catch (err) {
+      if (err.code === 'FISCAL_YEAR_CLOSED') {
+        return res.status(400).json({ success: false, message: err.message });
+      }
+      throw err;
+    }
+
+    const {
+      date,
+      expenseType,
+      expenseAccountId,
+      vendorId,
+      items,
+      amount,
+      taxRate,
+      description,
+      reference,
+      paymentMethod,
+      bankAccountId
+    } = req.body;
+
+    let vendorName = existing.vendorName;
+    if (vendorId) {
+      const vendor = await prisma.supplier.findFirst({
+        where: {
+          id: vendorId,
+          companyId: companyId}
+      });
+      if (vendor) {
+        vendorName = vendor.name;
+      }
+    }
+
+    let cleanBankAccountId = null;
+    const rawValue = bankAccountId !== null && bankAccountId !== undefined 
+      ? String(bankAccountId).trim() 
+      : '';
+
+    if (rawValue && 
+        rawValue !== 'null' && 
+        rawValue !== 'NULL' && 
+        rawValue !== 'undefined' &&
+        rawValue !== '') {
+      cleanBankAccountId = rawValue;
+    }
+
+    const finalPaymentMethod = paymentMethod || existing.paymentMethod || 'Cash';
+    if (finalPaymentMethod === 'Cash') {
+      cleanBankAccountId = null;
+    }
+
+    let bankAccountData = null;
+    if (cleanBankAccountId) {
+      bankAccountData = await prisma.bankAccount.findFirst({
+        where: {
+          id: cleanBankAccountId,
+          companyId: companyId}
+        ,
+        include: { chartOfAccount: true }
+      });
+      if (!bankAccountData) {
+        return res.status(400).json({
+          success: false,
+          message: 'Bank account not found or does not belong to you'
+        });
+      }
+    }
+
+    const nextExpenseAccountId = expenseAccountId || existing.expenseAccountId;
+    const expenseAccount = await prisma.chartOfAccount.findFirst({
+      where: {
+        id: nextExpenseAccountId,
+        companyId: companyId,
+        type: 'Expense'
+      }
+    });
+    if (!expenseAccount) {
+      return res.status(400).json({
+        success: false,
+        message: 'Selected expense account not found'
+      });
+    }
+
+    const wasPosted = existing.status === 'Posted';
+    if (wasPosted) {
+      await reverseExpenseJournals(existing, userId, companyId);
+      await reverseExpenseBalances(existing, companyId);
+    }
+
+    const updateData = {
+      date: date || existing.date,
+      expenseType: expenseType || existing.expenseType,
+      expenseAccountId: nextExpenseAccountId,
+      vendorId: vendorId !== undefined ? vendorId : existing.vendorId,
+      vendorName: vendorName || existing.vendorName,
+      description: description !== undefined ? description : existing.description,
+      reference: reference !== undefined ? reference : existing.reference,
+      paymentMethod: finalPaymentMethod,
+      bankAccountId: cleanBankAccountId,
+      taxRate: taxRate !== undefined ? taxRate : existing.taxRate
+    };
+
+    let finalItems = [];
+    let finalAmount = 0;
+    let subtotal = 0;
+    let taxAmount = 0;
+    let totalAmount = 0;
+
+    const hasItems = items && items.length > 0;
+
+    if (hasItems) {
+      finalItems = items.map(item => ({
+        description: item.description,
+        quantity: item.quantity || 1,
+        unitPrice: item.unitPrice || 0,
+        amount: (item.quantity || 1) * (item.unitPrice || 0)
+      }));
+      subtotal = finalItems.reduce((sum, item) => sum + (item.amount || 0), 0);
+      taxAmount = subtotal * (updateData.taxRate || 0) / 100;
+      totalAmount = subtotal + taxAmount;
+      finalAmount = 0;
+      updateData.hasItems = true;
+      updateData.items = finalItems;
+      updateData.amount = finalAmount;
+      updateData.subtotal = subtotal;
+      updateData.taxAmount = taxAmount;
+      updateData.totalAmount = totalAmount;
+    } else if (amount !== undefined && amount > 0) {
+      finalAmount = amount;
+      subtotal = finalAmount;
+      totalAmount = finalAmount;
+      taxAmount = 0;
+      finalItems = [];
+      updateData.hasItems = false;
+      updateData.items = finalItems;
+      updateData.amount = finalAmount;
+      updateData.subtotal = subtotal;
+      updateData.taxAmount = taxAmount;
+      updateData.totalAmount = totalAmount;
+    }
+
+    const updated = await ExpenseModel.update(id, updateData);
+
+    if (wasPosted) {
+      let cashOrBankAccount;
+      if (finalPaymentMethod === 'Cash' || !cleanBankAccountId) {
+        cashOrBankAccount = await getOrCreateCashAccount(userId, companyId);
+      } else if (bankAccountData?.chartOfAccount) {
+        cashOrBankAccount = bankAccountData.chartOfAccount;
+      } else {
+        cashOrBankAccount = await getOrCreateCashAccount(userId, companyId);
+      }
+
+      await createExpenseJournalEntry(
+        userId,
+        companyId,
+        updated,
+        expenseAccount,
+        cashOrBankAccount
+      );
+      await applyExpenseBalances({
+        expenseAccount,
+        cashOrBankAccount,
+        bankAccountId: cleanBankAccountId,
+        bankAccountData,
+        totalAmount: updated.totalAmount
+      });
+    }
+
+    res.status(200).json({
+      success: true,
+      data: updated,
+      message: 'Expense updated. Ledger, cash/bank and reports now use the new amount.'
+    });
+
+} catch (error) {
+    console.error('❌ Update expense error:', error);
+    res.status(500).json({
+      success: false,
+      message: error.message
+    });
+  }
+};
+
+const deleteExpense = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const userId = req.user.id;
+
+    const companyId = (req.method === 'GET' || req.method === 'HEAD') ? (req.companyIdFilter ?? req.user.companyId) : req.user.companyId;
+    const existing = await prisma.expense.findFirst({
+      where: expenseAccessWhere(id, userId, companyId)
+    });
+
+    if (!existing) {
+      return res.status(404).json({
+        success: false,
+        message: 'Expense record not found'
+      });
+    }
+
+    try {
+      await fiscalYearGuard(userId, existing.date);
+    } catch (err) {
+      if (err.code === 'FISCAL_YEAR_CLOSED') {
+        return res.status(400).json({ success: false, message: err.message });
+      }
+      throw err;
+    }
+
+    if (existing.status === 'Posted') {
+      await reverseExpenseJournals(existing, userId, companyId);
+      await reverseExpenseBalances(existing, companyId);
+    }
+
+    await ExpenseModel.delete(id);
+
+    res.status(200).json({
+      success: true,
+      message: 'Expense record deleted successfully'
+    });
+
+} catch (error) {
+    console.error('❌ Delete expense error:', error);
+    res.status(500).json({
+      success: false,
+      message: error.message
+    });
+  }
+};
+
+const getSummary = async (req, res) => {
+  try {
+    const { startDate, endDate, locationId, status, expenseType } = req.query;
+    const userId = req.user.id;
+    const companyId = (req.method === 'GET' || req.method === 'HEAD') ? (req.companyIdFilter ?? req.user.companyId) : req.user.companyId;
+
+    const allMerged = await fetchAllExpensesMerged({
+      companyId,
+      userId,
+      locationId,
+      startDate,
+      endDate,
+      status,
+      expenseType
+    });
+
+    const summary = await ExpenseModel.getSummary(allMerged);
+
+    const now = new Date();
+    const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+    const startOfWeek = new Date(now);
+    startOfWeek.setDate(now.getDate() - now.getDay());
+    startOfWeek.setHours(0, 0, 0, 0);
+
+    const thisMonth = allMerged
+      .filter(e => new Date(e.date) >= startOfMonth)
+      .reduce((sum, e) => sum + (e.totalAmount || e.amount || 0), 0);
+    const thisWeek = allMerged
+      .filter(e => new Date(e.date) >= startOfWeek)
+      .reduce((sum, e) => sum + (e.totalAmount || e.amount || 0), 0);
+
+    res.status(200).json({
+      success: true,
+      data: {
+        ...summary,
+        thisMonth,
+        thisWeek
+      }
+    });
+  } catch (error) {
+    console.error('❌ Get expense summary error:', error);
+    res.status(500).json({
+      success: false,
+      message: error.message
+    });
+  }
+};
+
+const postExpense = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const userId = req.user.id;
+
+    const companyId = (req.method === 'GET' || req.method === 'HEAD') ? (req.companyIdFilter ?? req.user.companyId) : req.user.companyId;
+    const expense = await prisma.expense.findFirst({
+      where: {
+        id,
+        creator: {
+          id: userId
+        }
+      }
+    });
+
+    if (!expense) {
+      return res.status(404).json({
+        success: false,
+        message: 'Expense record not found'
+      });
+    }
+
+    if (expense.status === 'Posted') {
+      return res.status(400).json({
+        success: false,
+        message: 'Expense already posted'
+      });
+    }
+
+    let expenseForJournal = expense;
+    if (!expense.locationId) {
+      const resolvedLocationId = await resolveLocationId(
+        prisma,
+        companyId,
+        pickRequestedLocationId(req),
+        userId
+      );
+      expenseForJournal = await prisma.expense.update({
+        where: { id },
+        data: { locationId: resolvedLocationId }
+      });
+    }
+
+    const expenseAccount = await prisma.chartOfAccount.findFirst({
+      where: {
+        id: expense.expenseAccountId,
+        companyId: companyId,
+        type: 'Expense'
+      }
+    });
+
+    if (!expenseAccount) {
+      return res.status(400).json({
+        success: false,
+        message: 'Expense account not found. Please recreate the expense.'
+      });
+    }
+
+    const posted = await ExpenseModel.postExpense(id, userId);
+
+    let cashOrBankAccount;
+
+    if (expense.paymentMethod === 'Cash' || !expense.bankAccountId) {
+      cashOrBankAccount = await getOrCreateCashAccount(userId, companyId);
+    } else if (expense.bankAccountId) {
+      const bankAccount = await prisma.bankAccount.findFirst({
+        where: {
+          id: expense.bankAccountId,
+          companyId: companyId},
+        include: {
+          chartOfAccount: true
+        }
+      });
+      if (bankAccount && bankAccount.chartOfAccount) {
+        cashOrBankAccount = bankAccount.chartOfAccount;
+      }
+    }
+
+    if (!cashOrBankAccount) {
+      cashOrBankAccount = await getOrCreateCashAccount(userId, companyId);
+    }
+
+    await createExpenseJournalEntry(userId, companyId, expenseForJournal, expenseAccount, cashOrBankAccount);
+
+    if (expense.bankAccountId) {
+      const bankAccount = await prisma.bankAccount.findFirst({
+        where: {
+          id: expense.bankAccountId,
+          companyId: companyId}
+      });
+      if (bankAccount) {
+        await prisma.bankAccount.update({
+          where: { id: expense.bankAccountId },
+          data: { currentBalance: { decrement: expense.totalAmount } }
+        });
+        await prisma.chartOfAccount.update({
+          where: { id: bankAccount.chartOfAccountId },
+          data: { currentBalance: { decrement: expense.totalAmount } }
+        });
+      }
+    } else if (cashOrBankAccount) {
+      await prisma.chartOfAccount.update({
+        where: { id: cashOrBankAccount.id },
+        data: { currentBalance: { decrement: expense.totalAmount } }
+      });
+    }
+
+    await prisma.chartOfAccount.update({
+      where: { id: expenseAccount.id },
+      data: { currentBalance: { increment: expense.totalAmount } }
+    });
+
+    res.status(200).json({
+      success: true,
+      data: posted,
+      message: 'Expense posted successfully'
+    });
+
+} catch (error) {
+    console.error('❌ Post expense error:', error);
+    res.status(500).json({
+      success: false,
+      message: error.message
+    });
+  }
+};
+
+module.exports = {
+  createExpense,
+  createExpenseFromPurchasePayment,
+  getExpenses,
+  getExpense,
+  updateExpense,
+  deleteExpense,
+  getSummary,
+  postExpense,
+  getExpenseAccounts
+};

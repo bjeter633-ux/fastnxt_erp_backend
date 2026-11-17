@@ -1,0 +1,180 @@
+/**
+ * POS master-data change log.
+ * Isolated from ERP CRUD — callers record after a successful write.
+ */
+const prisma = require('../../prisma/client');
+
+const ENTITY = {
+  CATEGORY: 'CATEGORY',
+  SUBCATEGORY: 'SUBCATEGORY',
+  PRODUCT: 'PRODUCT',
+};
+
+function categoryEntityType(category) {
+  return category?.parentId ? ENTITY.SUBCATEGORY : ENTITY.CATEGORY;
+}
+
+function categoryPayload(category, isDeleted = false) {
+  const deleted = Boolean(isDeleted || category.isDeleted || category.isActive === false);
+  // Category images are POS-local only — never replicate via master sync
+  const base = {
+    id: category.id,
+    name: category.name,
+    code: category.code || '',
+    description: category.description || '',
+    updatedAt: (category.updatedAt || new Date()).toISOString(),
+    isDeleted: deleted,
+    isActive: category.isActive !== false && !deleted,
+    syncId: category.syncId || null,
+    syncStatus: category.syncStatus || 'SYNCED',
+    lastSyncedAt: (category.lastSyncedAt && new Date(category.lastSyncedAt).toISOString()) || null,
+  };
+  if (category.parentId) {
+    return { ...base, categoryId: category.parentId };
+  }
+  return { ...base, parentId: null };
+}
+
+function productPayload(product, categoryRow, isDeleted = false) {
+  const deleted = Boolean(isDeleted || product.isActive === false);
+  let categoryId = product.categoryId || null;
+  let subcategoryId = null;
+  if (categoryRow?.parentId) {
+    subcategoryId = categoryRow.id;
+    categoryId = categoryRow.parentId;
+  }
+  return {
+    id: product.id,
+    categoryId,
+    subcategoryId,
+    name: product.name,
+    sku: product.sku || product.sku || '',
+    barcode: product.barcodeNumber || product.barcodeNumber || product.barcode || '',
+    price: Number(product.sellingPrice ?? product.sellingPrice ?? 0),
+    sellingPrice: Number(product.sellingPrice ?? product.price ?? 0),
+    costPrice: Number(product.costPrice ?? product.cost_price ?? product.landingCost ?? 0),
+    taxRate: Number(product.taxRate ?? product.taxRate ?? 0),
+    taxType: product.taxType || product.taxType || 'Exclusive',
+    currentStock: Number(product.currentStock ?? product.availableStock ?? product.currentStock ?? 0),
+    mainImage: product.mainImage || (Array.isArray(product.images) && product.images[0]) || '',
+    stockUnitName: product.stockUnitName || product.stockUnit || 'Pcs',
+    purchaseUnitName: product.purchaseUnitName || product.stockUnitName || 'Pcs',
+    salesUnitName: product.salesUnitName || product.stockUnitName || 'Pcs',
+    purchaseConversionFactor: Number(product.purchaseConversionFactor ?? 1) || 1,
+    salesConversionFactor: Number(product.salesConversionFactor ?? 1) || 1,
+    allowFractionalQty: Boolean(product.allowFractionalQty),
+    trackInventory: product.trackInventory !== false,
+    itemType: product.itemType || 'READY_ITEM',
+    showInPos: product.showInPos !== false,
+    stockUnitName: product.stockUnitName || product.stockUnit || 'Pcs',
+    salesUnitName: product.salesUnitName || product.salesUnit || product.stockUnitName || 'Pcs',
+    purchaseUnitName: product.purchaseUnitName || product.purchaseUnit || product.stockUnitName || 'Pcs',
+    salesConversionFactor: Number(product.salesConversionFactor ?? 1) || 1,
+    purchaseConversionFactor: Number(product.purchaseConversionFactor ?? 1) || 1,
+    allowFractionalQty: Boolean(product.allowFractionalQty),
+    units: Array.isArray(product.units)
+      ? product.units
+      : Array.isArray(product.productUnits)
+        ? product.productUnits.map((u) => ({
+            id: u.id,
+            unitName: u.unitName,
+            unitCode: u.unitCode,
+            conversionFactor: Number(u.conversionFactor) || 1,
+            isBase: Boolean(u.isBase),
+            allowPurchase: u.allowPurchase !== false,
+            allowSale: u.allowSale !== false,
+            isDefaultSale: Boolean(u.isDefaultSale),
+            isDefaultPurchase: Boolean(u.isDefaultPurchase),
+            barcode: u.barcode || null,
+            purchasePrice: u.purchasePrice != null ? Number(u.purchasePrice) : null,
+            sellingPrice: u.sellingPrice != null ? Number(u.sellingPrice) : null,
+            sortOrder: Number(u.sortOrder) || 0,
+          }))
+        : undefined,
+    isActive: !deleted,
+    isDeleted: deleted,
+    updatedAt: (product.updatedAt || new Date()).toISOString(),
+    syncId: product.syncId || null,
+    syncStatus: product.syncStatus || 'SYNCED',
+    lastSyncedAt: (product.lastSyncedAt && new Date(product.lastSyncedAt).toISOString()) || null,
+  };
+}
+
+async function recordChange({ companyId, entityType, entityId, isDeleted, payload }) {
+  if (!companyId || !entityId || !entityType) return null;
+  try {
+    return await prisma.posMasterSyncChange.create({
+      data: {
+        companyId,
+        entityType,
+        entityId,
+        isDeleted: Boolean(isDeleted),
+        payload,
+      },
+    });
+  } catch (err) {
+    console.error('[pos-master-sync] changelog write failed:', err.message);
+    return null;
+  }
+}
+
+async function recordCategoryChange(category, { isDeleted = false } = {}) {
+  if (!category?.id || !category.companyId) return null;
+  return recordChange({
+    companyId: category.companyId,
+    entityType: categoryEntityType(category),
+    entityId: category.id,
+    isDeleted,
+    payload: categoryPayload(category, isDeleted),
+  });
+}
+
+async function recordProductChange(product, { isDeleted = false } = {}) {
+  if (!product?.id || !product.companyId) return null;
+  let categoryRow = null;
+  if (product.categoryId) {
+    try {
+      categoryRow = await prisma.category.findUnique({
+        where: { id: product.categoryId },
+        select: { id: true, parentId: true },
+      });
+    } catch {
+      categoryRow = null;
+    }
+  }
+  let withUnits = product;
+  if (!Array.isArray(product.units) && !Array.isArray(product.productUnits)) {
+    try {
+      const units = await prisma.productUnit.findMany({
+        where: { productId: product.id, isActive: true },
+        orderBy: [{ isBase: 'desc' }, { sortOrder: 'asc' }],
+      });
+      withUnits = { ...product, productUnits: units };
+    } catch {
+      withUnits = product;
+    }
+  }
+  return recordChange({
+    companyId: product.companyId,
+    entityType: ENTITY.PRODUCT,
+    entityId: product.id,
+    isDeleted,
+    payload: productPayload(withUnits, categoryRow, isDeleted),
+  });
+}
+
+async function recordCategoryDeletes(categories) {
+  for (const category of categories || []) {
+    await recordCategoryChange(category, { isDeleted: true });
+  }
+}
+
+module.exports = {
+  ENTITY,
+  categoryPayload,
+  productPayload,
+  recordChange,
+  recordCategoryChange,
+  recordProductChange,
+  recordCategoryDeletes,
+};
